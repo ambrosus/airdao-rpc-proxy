@@ -1,7 +1,7 @@
 const fastify = require('fastify')({ logger: true });
 
 
-const BACKEND_URL = process.env.BACKEND_URL || 'https://network.ambrosus-dev.io';
+const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
 const PORT = process.env.PORT || 3000;
 
 
@@ -96,7 +96,7 @@ function parseCallError(error) {
 
 
 async function sendToNetwork(request) {
-  const response = await fetch(BACKEND_URL, {
+  const response = await fetch(PROXY_TO, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
