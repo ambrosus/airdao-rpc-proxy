@@ -1,0 +1,14 @@
+{
+  "name": "airdao-rpc-proxy",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "fastify": "^4.28.1"
+  }
+}
