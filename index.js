@@ -2,7 +2,7 @@ const fastify = require('fastify')({ logger: true });
 
 
 const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8545;
 
 
 
@@ -22,10 +22,10 @@ async function handler(request, reply) {
 
   const fixed = await findAndFixErrors(userRequest, networkResponse);
 
-  fixed.forEach((res) => {
-    const resp = networkResponse.find((r) => r.id === res.id);
-    resp.error.data = "execution reverted: " + res.reason;
-  });
+  networkResponse.forEach((res) => {
+    if (fixed[res.id])
+      res.error = fixed[res.id];
+  })
 
   reply.send(isArr ? networkResponse : networkResponse[0]);
 }
@@ -34,7 +34,7 @@ async function handler(request, reply) {
 async function findAndFixErrors(request, response) {
 
   const needToCallTxs = [];
-  const fixedReverts = [];
+  let fixedReverts = {  };
 
   for (const res of response) {
     if (!res.error) continue;
@@ -42,8 +42,8 @@ async function findAndFixErrors(request, response) {
     const req = request.find((r) => r.id === res.id);
     if (!req) throw new Error(`Request ${res.id} not found`);
 
-    // if it was a gas estimation, we need to make a call to get the revert reason
-    if (req.method === "eth_estimateGas") {
+    // if it was a gas estimation or raw tx, we need to make a call to get the revert reason
+    if (req.method === "eth_estimateGas" || req.method === "eth_sendRawTransaction") {
       if (res.error.data !== "Reverted") {
         console.warn('Error, but not "Reverted"', res);
         continue;
@@ -53,23 +53,24 @@ async function findAndFixErrors(request, response) {
     }
 
     // if it was a call, we need to parse the revert reason
-    if (req.method === "eth_call") {
-      const reason = parseCallError(res.error);
-      if (!reason) {
+    else if (req.method === "eth_call") {
+      const fixedError = parseCallError(res.error);
+      if (!fixedError) {
         console.warn("Can't parse error", res);
         continue;
       }
 
-      fixedReverts.push({ id: res.id, reason: reason });
+      fixedReverts[res.id] = fixedError;
     }
 
+    console.log(req, response)
   }
 
 
   if (needToCallTxs.length > 0) {
     const networkResponse = await sendToNetwork(needToCallTxs);
     const fixed = await findAndFixErrors(needToCallTxs, networkResponse);
-    fixedReverts.push(...fixed);
+    fixedReverts = { ...fixedReverts, ...fixed };
   }
 
 
@@ -79,18 +80,32 @@ async function findAndFixErrors(request, response) {
 
 
 function parseCallError(error) {
-  if (!error.data.startsWith("Reverted 0x08c379a0"))
+  if (!error.data.startsWith("Reverted"))
     return;
 
-  // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
-  // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
-  let reason = error.data.substring(9);
-  if (reason.length < 138 || !reason.startsWith("0x08c379a0")) {
-    console.warn("Not error signature", reason);
-    return;
+  const reason = error.data.substring(9);
+
+  const newError = {
+    code: error.code,
+    message: "execution reverted",
+    data: reason
   }
 
-  return hexToAscii(reason.substring(138)).replaceAll('\x00', '');
+
+  if (reason.startsWith("0x08c379a0")) {
+    // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
+    // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
+    const parsed = hexToAscii(reason.substring(138)).replaceAll('\x00', '');
+    newError.message  += `: Error("${parsed}")`;
+  }
+  else if (reason.startsWith("0x4e487b71")) {
+    const parsed = hexToAscii(reason.substring(138)).replaceAll('\x00', '');
+    newError.message += `: Panic("${parsed}")`;
+  }
+
+  console.log("Parsed error", newError);
+
+  return newError;
 }
 
 
