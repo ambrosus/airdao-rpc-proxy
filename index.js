@@ -63,7 +63,6 @@ async function findAndFixErrors(request, response) {
       fixedReverts[res.id] = fixedError;
     }
 
-    console.log(req, response)
   }
 
 
@@ -80,7 +79,7 @@ async function findAndFixErrors(request, response) {
 
 
 function parseCallError(error) {
-  if (!error.data.startsWith("Reverted"))
+  if (!error?.data?.startsWith("Reverted"))
     return;
 
   const reason = error.data.substring(9);
@@ -102,8 +101,6 @@ function parseCallError(error) {
     const parsed = hexToAscii(reason.substring(138)).replaceAll('\x00', '');
     newError.message += `: Panic("${parsed}")`;
   }
-
-  console.log("Parsed error", newError);
 
   return newError;
 }
