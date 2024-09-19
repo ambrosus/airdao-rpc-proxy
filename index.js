@@ -1,3 +1,4 @@
+const cors = require("@fastify/cors");
 const fastify = require('fastify')({ logger: true });
 
 
@@ -8,6 +9,7 @@ const PORT = process.env.PORT || 8545;
 
 // Start the server
 async function main() {
+  await fastify.register(cors, {origin: '*'});
   fastify.post('/', handler);
   await fastify.listen({ port: PORT });
   fastify.log.info(`Listening on port ${PORT}`);
