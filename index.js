@@ -136,7 +136,12 @@ async function sendToNetwork(request) {
     body: JSON.stringify(request),
   });
 
-  return response.json();
+  try {
+    return response.json();
+  } catch (e) {
+    console.error("Error parsing response from original rpc", await response.text());
+    throw e;
+  }
 }
 
 const hexToAscii = (hex) => Buffer.from(hex, 'hex').toString('utf8')
