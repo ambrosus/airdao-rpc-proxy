@@ -35,6 +35,8 @@ function prepareUserRequest(request) {
 }
 
 async function handler(request, reply) {
+  console.log("Original user request:", JSON.stringify(request.body, undefined, 4));
+
   const { isArr, userRequest } = prepareUserRequest(request);
   const networkResponse = await sendToNetwork(userRequest);
 
