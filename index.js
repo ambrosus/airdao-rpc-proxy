@@ -17,10 +17,28 @@ async function main() {
 }
 
 
-async function handler(request, reply) {
+function prepareUserRequest(request) {
   const isArr = Array.isArray(request.body);
   const userRequest = isArr ? request.body : [request.body];
+
+  userRequest.forEach((req) => {
+    req?.params?.forEach((p) => {
+      if (p?.input) {
+        p.data = p.input;
+        delete p.input;
+      }
+      delete p?.chainId
+    });
+  });
+
+  return { isArr, userRequest };
+}
+
+async function handler(request, reply) {
+  const { isArr, userRequest } = prepareUserRequest(request);
   const networkResponse = await sendToNetwork(userRequest);
+
+  console.log(JSON.stringify(userRequest, undefined, 4), networkResponse)
 
   const fixed = await findAndFixErrors(userRequest, networkResponse);
 
