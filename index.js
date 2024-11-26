@@ -1,4 +1,5 @@
 const cors = require("@fastify/cors");
+const { ethers} = require("ethers");
 const fastify = require('fastify')({ logger: true });
 
 
@@ -6,6 +7,7 @@ const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
 const PORT = process.env.PORT || 8545;
 
 
+const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
 // Start the server
 async function main() {
@@ -24,10 +26,14 @@ function prepareUserRequest(request) {
   userRequest.forEach((req) => {
     req?.params?.forEach((p) => {
       if (p?.input) {
-        p.data = p.input;
+        p.data = p.input;  // viem use `input` instead of `data`
         delete p.input;
       }
+      if (req.method === "eth_estimateGas") {
+        delete p?.type; // remix sends this
+      }
       delete p?.chainId
+
     });
   });
 
@@ -49,7 +55,8 @@ async function handler(request, reply) {
       res.error = fixed[res.id];
   })
 
-  reply.send(isArr ? networkResponse : networkResponse[0]);
+  const response = isArr ? networkResponse : networkResponse[0];
+  reply.send(response);
 }
 
 
@@ -66,12 +73,19 @@ async function findAndFixErrors(request, response) {
 
     // if it was a gas estimation or raw tx, we need to make a call to get the revert reason
     if (req.method === "eth_estimateGas" || req.method === "eth_sendRawTransaction") {
-      if (res.error.data !== "Reverted") {
-        console.warn('Error, but not "Reverted"', res);
-        continue;
+      if (res.error.data.startsWith("Reverted")) {
+        needToCallTxs.push({ ...req, method: "eth_call" });
       }
-
-      needToCallTxs.push({ ...req, method: "eth_call" });
+      if (res.error.data.includes("Bad instruction")) {
+        fixedReverts[res.id] = {
+          code: res.error.code,
+          message: `${res.error.data}. Most likely you need to change EVM version. Check documentation: https://docs.airdao.io/build-on-airdao/smart-contract-overview`,
+          data: res.error.data
+        }
+      }
+      else {
+        console.warn("Error, not fixed", res);
+      }
     }
 
     // if it was a call, we need to parse the revert reason
@@ -85,13 +99,13 @@ async function findAndFixErrors(request, response) {
       fixedReverts[res.id] = fixedError;
     }
 
+
   }
 
 
   if (needToCallTxs.length > 0) {
-    const networkResponse = await sendToNetwork(needToCallTxs);
-    const fixed = await findAndFixErrors(needToCallTxs, networkResponse);
-    fixedReverts = { ...fixedReverts, ...fixed };
+    const anotherFixedReverts = await findAndFixErrors(needToCallTxs, await sendToNetwork(needToCallTxs));
+    fixedReverts = { ...fixedReverts, ...anotherFixedReverts };
   }
 
 
@@ -116,12 +130,12 @@ function parseCallError(error) {
   if (reason.startsWith("0x08c379a0")) {
     // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
     // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
-    const parsed = hexToAscii(reason.substring(138)).replaceAll('\x00', '');
+    const parsed = abiCoder.decode(["string"], ethers.getBytes(reason).slice(4))[0];
     newError.message  += `: Error("${parsed}")`;
   }
   else if (reason.startsWith("0x4e487b71")) {
-    const parsed = hexToAscii(reason.substring(138)).replaceAll('\x00', '');
-    newError.message += `: Panic("${parsed}")`;
+    const code = Number(abiCoder.decode(["uint256"], ethers.getBytes(reason).slice(4))[0]);
+    newError.message += `: Panic(${code}) (${PanicReasons[code] ?? "Unknown panic code"})`;
   }
 
   return newError;
@@ -144,7 +158,18 @@ async function sendToNetwork(request) {
   }
 }
 
-const hexToAscii = (hex) => Buffer.from(hex, 'hex').toString('utf8')
 
+const PanicReasons = {
+  0x00: "GENERIC_PANIC",
+  0x01: "ASSERT_FALSE",
+  0x11: "OVERFLOW",
+  0x12: "DIVIDE_BY_ZERO",
+  0x21: "ENUM_RANGE_ERROR",
+  0x22: "BAD_STORAGE_DATA",
+  0x31: "STACK_UNDERFLOW",
+  0x32: "ARRAY_RANGE_ERROR",
+  0x41: "OUT_OF_MEMORY",
+  0x51: "UNINITIALIZED_FUNCTION_CALL",
+}
 
 main();
