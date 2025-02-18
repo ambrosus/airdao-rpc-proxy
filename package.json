@@ -10,7 +10,9 @@
   "description": "",
   "dependencies": {
     "@fastify/cors": "^8.2.0",
+    "@fastify/websocket": "^8.3.1",
     "ethers": "^6.13.4",
-    "fastify": "^4.28.1"
+    "fastify": "^4.28.1",
+    "ws": "^8.17.1"
   }
 }

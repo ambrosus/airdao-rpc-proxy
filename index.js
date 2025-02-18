@@ -1,5 +1,7 @@
 const cors = require("@fastify/cors");
-const { ethers} = require("ethers");
+const websocket = require('@fastify/websocket');
+const { WebSocket } = require('ws');
+const { ethers } = require("ethers");
 const fastify = require('fastify')({ logger: true });
 
 
@@ -12,7 +14,173 @@ const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 // Start the server
 async function main() {
   await fastify.register(cors, {origin: '*'});
+  await fastify.register(websocket);
+
+  // HTTP handler
   fastify.post('/', handler);
+
+  // WebSocket handler
+  fastify.get('/ws', { websocket: true }, (connection, req) => {
+    let wsClient = null;
+    let wsReady = false;
+    let connectionAttempts = 0;
+    const maxAttempts = 5;
+    const messageQueue = new Map();
+    
+    function connectWs() {
+      if (connectionAttempts >= maxAttempts) {
+        console.error('Max connection attempts reached');
+        return;
+      }
+
+      connectionAttempts++;
+      const wsUrl = PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
+      console.log(`Attempting to connect to backend WS (attempt ${connectionAttempts}/${maxAttempts}): ${wsUrl}`);
+      
+      try {
+        wsClient = new WebSocket(wsUrl, {
+          handshakeTimeout: 10000,
+          maxPayload: 100 * 1024 * 1024,
+          perMessageDeflate: false,
+          followRedirects: true
+        });
+        
+        wsClient.on('open', () => {
+          console.log('Backend WS connected successfully');
+          wsReady = true;
+          connectionAttempts = 0;
+        });
+
+        wsClient.on('ping', () => {
+          wsClient.pong();
+        });
+
+        wsClient.on('message', (data) => {
+          if (connection.socket.readyState === WebSocket.OPEN) {
+            try {
+              const response = JSON.parse(data.toString());
+              // Remove a request from the queue after receiving a response
+              messageQueue.delete(response.id);
+              connection.socket.send(data);
+            } catch (err) {
+              console.error('Error sending message to client:', err);
+            }
+          }
+        });
+
+        wsClient.on('close', (code, reason) => {
+          console.log('Backend WS closed:', code, reason);
+          wsReady = false;
+          if (connectionAttempts < maxAttempts) {
+            const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
+            console.log(`Reconnecting in ${timeout}ms...`);
+            setTimeout(connectWs, timeout);
+          }
+        });
+
+        wsClient.on('error', (error) => {
+          console.error('Backend WS error:', error);
+          wsReady = false;
+        });
+
+      } catch (err) {
+        console.error('Error creating WebSocket:', err);
+        if (connectionAttempts < maxAttempts) {
+          const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
+          setTimeout(connectWs, timeout);
+        }
+      }
+    }
+
+    connectWs();
+
+    // Keep-alive ping every 30 seconds
+    const pingInterval = setInterval(() => {
+      if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+        wsClient.ping();
+      }
+    }, 30000);
+
+    connection.socket.on('message', async (data) => {
+      try {
+        if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
+          if (!wsReady && connectionAttempts < maxAttempts) {
+            connectWs();
+          }
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Backend WebSocket is not connected. Please try again in a few seconds.'
+            },
+            id: JSON.parse(data)?.id || null
+          }));
+          return;
+        }
+
+        const request = JSON.parse(data);
+        const requestId = request.id;
+
+        // Check if the request is not already in the queue
+        if (messageQueue.has(requestId)) {
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Request with this ID is already in progress'
+            },
+            id: requestId
+          }));
+          return;
+        }
+
+        // Apply the same transformations as for HTTP requests
+        const { userRequest } = prepareUserRequest({ body: request });
+        messageQueue.set(requestId, userRequest);
+        wsClient.send(JSON.stringify(userRequest));
+
+        // Timeout for request
+        setTimeout(() => {
+          if (messageQueue.has(requestId)) {
+            messageQueue.delete(requestId);
+            if (connection.socket.readyState === WebSocket.OPEN) {
+              connection.socket.send(JSON.stringify({
+                jsonrpc: '2.0',
+                error: {
+                  code: -32000,
+                  message: 'Request timeout'
+                },
+                id: requestId
+              }));
+            }
+          }
+        }, 30000); // 30-second timeout
+
+      } catch (err) {
+        console.error('Error processing WS message:', err);
+        if (connection.socket.readyState === WebSocket.OPEN) {
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Internal server error'
+            },
+            id: null
+          }));
+        }
+      }
+    });
+
+    connection.socket.on('close', () => {
+      console.log('Client disconnected');
+      clearInterval(pingInterval);
+      messageQueue.clear(); // Clearing the queue on disconnection
+      if (wsClient) {
+        wsClient.close();
+      }
+    });
+  });
+
   await fastify.listen({ port: PORT });
   fastify.log.info(`Listening on port ${PORT}`);
 
