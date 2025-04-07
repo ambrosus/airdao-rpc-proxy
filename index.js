@@ -1,4 +1,3 @@
-// index.js
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -21,7 +20,6 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use('/rpc', (req, res, next) => {
   if (req.body && req.body.params) {
     // Replace input with data in the request body
-    // Modify this according to your specific requirements
     req.body.params = req.body.params.map(param => {
       if (param && param.input) {
         return { ...param, data: param.input, input: undefined };
@@ -56,12 +54,40 @@ const server = http.createServer(app);
 // Create WebSocket server
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
+// Helper function to reconnect WebSocket
+function reconnectWebSocket(ws, targetWs) {
+  if (targetWs.readyState !== WebSocket.OPEN) {
+    console.log('Reconnecting to target WebSocket...');
+    targetWs = new WebSocket(WS_TARGET);
+    
+    targetWs.on('open', () => {
+      console.log('Connected to target WebSocket');
+    });
+
+    targetWs.on('message', (message) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    });
+
+    targetWs.on('error', (error) => {
+      console.error('Target WebSocket error:', error);
+      ws.close();
+    });
+
+    targetWs.on('close', () => {
+      console.log('Target WebSocket closed, reconnecting...');
+      reconnectWebSocket(ws, targetWs);
+    });
+  }
+}
+
 // Handle WebSocket connections
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
   
   // Create a connection to the target WebSocket server
-  const targetWs = new WebSocket(WS_TARGET);
+  let targetWs = new WebSocket(WS_TARGET);
   
   // Handle messages from client
   ws.on('message', (message) => {
@@ -82,6 +108,8 @@ wss.on('connection', (ws) => {
       // Forward the modified message to the target
       if (targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(JSON.stringify(parsedMessage));
+      } else {
+        reconnectWebSocket(ws, targetWs);
       }
     } catch (error) {
       console.error('Error processing WebSocket message:', error);
