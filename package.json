@@ -9,12 +9,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@fastify/cors": "^8.0.0",
-    "@fastify/websocket": "^8.0.0",
-    "@fastify/formbody": "^7.0.0",
-    "ethers": "^6.0.0",
-    "fastify": "^4.0.0",
-    "ws": "^8.0.0",
-    "pino-pretty": "^10.0.0"
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "ws": "^8.13.0",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2"
   }
 }
