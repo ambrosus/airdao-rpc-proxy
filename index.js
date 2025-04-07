@@ -8,74 +8,67 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 
-// Настройка логирования
+// Fastify server with optimized logging
 const fastify = require('fastify')({
   logger: {
-    transport: process.env.NODE_ENV === 'development' 
-      ? { target: 'pino-pretty' } 
-      : undefined,
+    transport: process.env.NODE_ENV === 'development' ? { target: 'pino-pretty' } : undefined,
     level: process.env.LOG_LEVEL || 'info',
     redact: ['req.headers.authorization'],
     serializers: {
-      err: (err) => {
-        // Пользовательский сериализатор для ошибок
-        return {
-          type: err.constructor.name,
-          message: err.message,
-          stack: err.stack,
-          code: err.code,
-          statusCode: err.statusCode,
-          ...(err.cause && { cause: err.cause })
-        };
-      }
+      err: (err) => ({
+        type: err.constructor.name,
+        message: err.message,
+        stack: err.stack,
+        code: err.code,
+        statusCode: err.statusCode,
+        ...(err.cause && { cause: err.cause })
+      })
     }
-  }
+  },
+  disableRequestLogging: process.env.DISABLE_REQUEST_LOGGING === 'true',
+  trustProxy: true // Trust X-Forwarded-For headers from nginx
 });
 
-// Конфигурация
+// Configuration
 const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
 const PORT = parseInt(process.env.PORT || '8545', 10);
 const TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000', 10);
-const MAX_PAYLOAD_SIZE = parseInt(process.env.MAX_PAYLOAD_SIZE || '10485760', 10); // 10MB
+const MAX_PAYLOAD_SIZE = parseInt(process.env.MAX_PAYLOAD_SIZE || '10485760', 10);
 const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '20', 10);
 const ERROR_LOG_PATH = process.env.ERROR_LOG_PATH || '/app/logs/errors';
 const MAX_ERROR_LOGS = parseInt(process.env.MAX_ERROR_LOGS || '1000', 10);
-const LOG_ROTATION_INTERVAL = parseInt(process.env.LOG_ROTATION_INTERVAL || '86400000', 10); // 24 часа в мс
+const LOG_ROTATION_INTERVAL = parseInt(process.env.LOG_ROTATION_INTERVAL || '86400000', 10);
 const MAX_PARALLEL_CONNECTIONS = parseInt(process.env.MAX_PARALLEL_CONNECTIONS || '5', 10);
 const HEALTH_CHECK_INTERVAL = parseInt(process.env.HEALTH_CHECK_INTERVAL || '60000', 10);
+const MEMORY_METRICS_INTERVAL = parseInt(process.env.MEMORY_METRICS_INTERVAL || '60000', 10);
+const HTTP_KEEP_ALIVE_TIMEOUT = parseInt(process.env.HTTP_KEEP_ALIVE_TIMEOUT || '5000', 10);
+const ERROR_SAMPLING_RATE = parseFloat(process.env.ERROR_SAMPLING_RATE || '1.0'); // 1.0 = log all errors
 
-// Массив альтернативных RPC endpoints для WebSocket
+// RPC endpoints for WebSocket
 const RPC_ENDPOINTS = [
   PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws',
   'wss://network.ambrosus.io/ws',
-  // Добавьте другие резервные эндпоинты, если они есть
+  ...(process.env.ADDITIONAL_WS_ENDPOINTS ? process.env.ADDITIONAL_WS_ENDPOINTS.split(',') : [])
 ];
 
-// Метрики для мониторинга
+// Metrics for monitoring
 const metrics = {
-  // HTTP метрики
   httpRequestsTotal: 0,
   httpRequestsSuccess: 0,
   httpRequestsError: 0,
-  httpRequestDurations: [], // последние 100 запросов для расчета среднего времени
-  
-  // WebSocket метрики
+  httpRequestDurations: [], // last 100 requests
   wsConnectionsTotal: 0,
   wsConnectionsActive: 0,
   wsConnectionsSuccessful: 0,
   wsConnectionsFailed: 0,
-  wsConnectionsDuration: [], // длительность соединений
+  wsConnectionsDuration: [],
   wsMessagesReceived: 0,
   wsMessagesSent: 0,
   wsReconnectAttempts: 0,
-  wsQuickDisconnects: 0, // соединения, закрытые менее чем через 5 секунд
-  
-  // Системные метрики
+  wsQuickDisconnects: 0,
   startTime: Date.now(),
   lastMemoryUsage: process.memoryUsage(),
-  memoryUsageHistory: [], // история использования памяти
-  
-  // Эндпоинт метрики
+  memoryUsageHistory: [],
   currentEndpointIndex: 0,
   endpointStats: RPC_ENDPOINTS.map(url => ({
     url,
@@ -87,25 +80,22 @@ const metrics = {
     averageConnectionDuration: 0
   })),
   
-  // Обновление метрик памяти
-  updateMemoryMetrics: function() {
+  updateMemoryMetrics() {
     this.lastMemoryUsage = process.memoryUsage();
     
-    // Хранить историю использования памяти за последний час (с интервалом 1 минута)
-    if (this.memoryUsageHistory.length > 60) {
+    if (this.memoryUsageHistory.length > 30) { // Reduced from 60 to 30 entries
       this.memoryUsageHistory.shift();
     }
     
     this.memoryUsageHistory.push({
       timestamp: Date.now(),
-      rss: Math.round(this.lastMemoryUsage.rss / 1024 / 1024), // MB
-      heapTotal: Math.round(this.lastMemoryUsage.heapTotal / 1024 / 1024), // MB
-      heapUsed: Math.round(this.lastMemoryUsage.heapUsed / 1024 / 1024) // MB
+      rss: Math.round(this.lastMemoryUsage.rss / 1024 / 1024),
+      heapTotal: Math.round(this.lastMemoryUsage.heapTotal / 1024 / 1024),
+      heapUsed: Math.round(this.lastMemoryUsage.heapUsed / 1024 / 1024)
     });
   },
   
-  // Обновление статистики эндпоинта
-  updateEndpointStats: function(index, isConnected, duration = null) {
+  updateEndpointStats(index, isConnected, duration = null) {
     const endpoint = this.endpointStats[index];
     endpoint.connectAttempts++;
     
@@ -114,7 +104,6 @@ const metrics = {
       endpoint.lastConnectTime = Date.now();
       
       if (duration !== null) {
-        // Обновляем среднее время соединения
         endpoint.averageConnectionDuration = 
           (endpoint.averageConnectionDuration * (endpoint.successfulConnects - 1) + duration) / 
           endpoint.successfulConnects;
@@ -125,24 +114,21 @@ const metrics = {
     }
   },
   
-  // Добавление длительности HTTP запроса для расчета среднего времени
-  addHttpRequestDuration: function(duration) {
+  addHttpRequestDuration(duration) {
     if (this.httpRequestDurations.length >= 100) {
       this.httpRequestDurations.shift();
     }
     this.httpRequestDurations.push(duration);
   },
   
-  // Добавление длительности WS соединения
-  addWsConnectionDuration: function(duration) {
-    if (this.wsConnectionsDuration.length >= 100) {
+  addWsConnectionDuration(duration) {
+    if (this.wsConnectionsDuration.length >= 50) { // Reduced from 100 to 50
       this.wsConnectionsDuration.shift();
     }
     this.wsConnectionsDuration.push(duration);
   },
   
-  // Обобщенные метрики
-  getStats: function() {
+  getStats() {
     const httpAvgDuration = this.httpRequestDurations.length > 0 
       ? this.httpRequestDurations.reduce((a, b) => a + b, 0) / this.httpRequestDurations.length
       : 0;
@@ -180,12 +166,9 @@ const metrics = {
           heapTotal: Math.round(this.lastMemoryUsage.heapTotal / 1024 / 1024) + 'MB',
           heapUsed: Math.round(this.lastMemoryUsage.heapUsed / 1024 / 1024) + 'MB'
         },
-        cpu: {
-          loadAverage: os.loadavg(),
-          cpus: os.cpus().length
-        },
+        loadAvg1m: os.loadavg()[0].toFixed(2),
+        cpus: os.cpus().length,
         platform: os.platform(),
-        arch: os.arch(),
         hostname: os.hostname()
       },
       endpoints: this.endpointStats
@@ -193,22 +176,22 @@ const metrics = {
   }
 };
 
-// Обновление метрик памяти каждую минуту
+// Update memory metrics periodically
 setInterval(() => {
   metrics.updateMemoryMetrics();
-}, 60000);
+}, MEMORY_METRICS_INTERVAL);
 
-// Переменные состояния для механизма переключения между эндпоинтами
+// State variables for endpoint switching
 let currentEndpointIndex = 0;
 let endpointFailureCount = 0;
 let activeConnectionAttempts = 0;
 let quickDisconnects = 0;
-const QUICK_DISCONNECT_THRESHOLD = 5; // секунд
+const QUICK_DISCONNECT_THRESHOLD = 5; // seconds
 const QUICK_DISCONNECT_COUNT_LIMIT = 10;
 
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
-// Создаем директорию для логов, если она не существует
+// Create error log directory
 if (!fs.existsSync(ERROR_LOG_PATH)) {
   try {
     fs.mkdirSync(ERROR_LOG_PATH, { recursive: true });
@@ -218,7 +201,7 @@ if (!fs.existsSync(ERROR_LOG_PATH)) {
   }
 }
 
-// Функция для очистки старых логов
+// Clean up old logs
 async function cleanupOldLogs() {
   try {
     const files = fs.readdirSync(ERROR_LOG_PATH)
@@ -228,27 +211,49 @@ async function cleanupOldLogs() {
         path: path.join(ERROR_LOG_PATH, file),
         time: fs.statSync(path.join(ERROR_LOG_PATH, file)).mtime.getTime()
       }))
-      .sort((a, b) => b.time - a.time); // Сортировка от новых к старым
+      .sort((a, b) => b.time - a.time);
     
-    // Удаляем логи, превышающие лимит
     if (files.length > MAX_ERROR_LOGS) {
       const filesToRemove = files.slice(MAX_ERROR_LOGS);
       for (const file of filesToRemove) {
         fs.unlinkSync(file.path);
       }
-      fastify.log.info(`Cleaned up ${filesToRemove.length} old error logs, keeping newest ${MAX_ERROR_LOGS}`);
+      fastify.log.info(`Cleaned up ${filesToRemove.length} old error logs`);
     }
   } catch (err) {
     fastify.log.error({ err }, 'Error cleaning up old logs');
   }
 }
 
-// Настроим периодическую очистку логов
+// Set up periodic log cleanup
 setInterval(cleanupOldLogs, LOG_ROTATION_INTERVAL);
-// И запустим очистку при старте
 cleanupOldLogs();
 
-// Проверка состояния сети для раннего обнаружения проблем
+// Graceful shutdown
+async function shutdown() {
+  fastify.log.info('Shutting down gracefully');
+  try {
+    await fastify.close();
+    fastify.log.info('Server closed successfully');
+    process.exit(0);
+  } catch (err) {
+    fastify.log.error({ err }, 'Error during shutdown');
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  fastify.log.error({ err }, 'Uncaught exception');
+});
+
+process.on('unhandledRejection', (reason) => {
+  fastify.log.error({ reason }, 'Unhandled rejection');
+});
+// Check network status
 async function checkNetworkStatus() {
   try {
     const controller = new AbortController();
@@ -269,15 +274,18 @@ async function checkNetworkStatus() {
   }
 }
 
-// Функция для логирования ошибок в файл
+// Log errors to file with error sampling
 function logErrorToFile(requestData, errorData) {
+  // Error sampling to reduce disk I/O
+  if (ERROR_SAMPLING_RATE < 1.0 && Math.random() > ERROR_SAMPLING_RATE) {
+    return null;
+  }
+
   const timestamp = new Date().toISOString();
-  // Создаем хеш на основе запроса для группировки похожих ошибок
   let requestHash = '';
   
   try {
     if (typeof requestData === 'object') {
-      // Создаем стабильный хеш на основе метода и параметров запроса
       const methodStr = Array.isArray(requestData) 
         ? requestData.map(r => r.method).join('_')
         : (requestData?.method || 'unknown');
@@ -295,12 +303,8 @@ function logErrorToFile(requestData, errorData) {
   const errorId = `error_${timestamp.replace(/[:.]/g, '-')}_${requestHash}`;
   const logFilePath = path.join(ERROR_LOG_PATH, `${errorId}.json`);
   
-  // Подготовка данных для лога с ограничением размера
-  let safeRequestData = requestData;
-  let safeErrorData = errorData;
-  
-  // Ограничиваем размер объектов для логирования
-  const truncateForLog = (obj, maxDepth = 3, currentDepth = 0) => {
+  // Truncate large objects for logging
+  const truncateForLog = (obj, maxDepth = 2, currentDepth = 0) => {
     if (currentDepth >= maxDepth) return '[Truncated]';
     
     if (Array.isArray(obj)) {
@@ -314,7 +318,6 @@ function logErrorToFile(requestData, errorData) {
       const entries = Object.entries(obj);
       
       if (entries.length > 20) {
-        // Если объект слишком большой, ограничим количество полей
         for (let i = 0; i < 20; i++) {
           const [key, value] = entries[i];
           result[key] = truncateForLog(value, maxDepth, currentDepth + 1);
@@ -328,22 +331,19 @@ function logErrorToFile(requestData, errorData) {
       return result;
     }
     
-    if (typeof obj === 'string' && obj.length > 1000) {
-      return obj.substring(0, 1000) + '... [truncated]';
+    if (typeof obj === 'string' && obj.length > 500) { // Reduced from 1000 to 500
+      return obj.substring(0, 500) + '... [truncated]';
     }
     
     return obj;
   };
   
-  safeRequestData = truncateForLog(requestData);
-  safeErrorData = truncateForLog(errorData);
-  
   const logData = {
     timestamp,
     requestHash,
     proxy_to: PROXY_TO,
-    request: safeRequestData,
-    error: safeErrorData
+    request: truncateForLog(requestData),
+    error: truncateForLog(errorData)
   };
   
   try {
@@ -356,31 +356,7 @@ function logErrorToFile(requestData, errorData) {
   }
 }
 
-// Обработка завершения работы
-async function shutdown() {
-  fastify.log.info('Shutting down gracefully');
-  try {
-    await fastify.close();
-    fastify.log.info('Server closed successfully');
-    process.exit(0);
-  } catch (err) {
-    fastify.log.error({ err }, 'Error during shutdown');
-    process.exit(1);
-  }
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-
-// Обработка неперехваченных ошибок
-process.on('uncaughtException', (err) => {
-  fastify.log.error({ err }, 'Uncaught exception');
-});
-
-process.on('unhandledRejection', (reason) => {
-  fastify.log.error({ reason }, 'Unhandled rejection');
-});
-
+// Prepare user request
 function prepareUserRequest(request) {
   const isArr = Array.isArray(request.body);
   const userRequest = isArr ? request.body : [request.body];
@@ -401,6 +377,7 @@ function prepareUserRequest(request) {
   return { isArr, userRequest };
 }
 
+// HTTP request handler
 async function handler(request, reply) {
   const originalRequest = request.body;
   const requestId = crypto.randomUUID();
@@ -413,20 +390,18 @@ async function handler(request, reply) {
   try {
     const { isArr, userRequest } = prepareUserRequest(request);
     
-    // Добавляем таймаут для запроса
+    // Add timeout for request
     const timeoutPromise = new Promise((_, reject) => 
       setTimeout(() => reject(new Error('Request timeout')), TIMEOUT)
     );
     
-    // Выполняем запрос с таймаутом
+    // Execute request with timeout
     const networkResponse = await Promise.race([
       sendToNetwork(userRequest, requestId),
       timeoutPromise
     ]);
 
     fastify.log.debug({ 
-      request: userRequest,
-      response: networkResponse,
       requestId,
       duration: Date.now() - startTime
     }, "Network response received");
@@ -448,9 +423,9 @@ async function handler(request, reply) {
     metrics.httpRequestsError++;
     metrics.addHttpRequestDuration(Date.now() - startTime);
     
-    fastify.log.error({ err, request: originalRequest, requestId, duration: Date.now() - startTime }, 'Error handling request');
+    fastify.log.error({ err, requestId, duration: Date.now() - startTime }, 'Error handling request');
     
-    // Логируем ошибку с деталями запроса
+    // Log error with request details
     const errorId = logErrorToFile(
       originalRequest, 
       { 
@@ -474,6 +449,8 @@ async function handler(request, reply) {
     });
   }
 }
+
+// Find and fix errors in response
 async function findAndFixErrors(request, response) {
   const needToCallTxs = [];
   let fixedReverts = {};
@@ -524,6 +501,7 @@ async function findAndFixErrors(request, response) {
   return fixedReverts;
 }
 
+// Parse call error
 function parseCallError(error) {
   if (!error?.data?.startsWith("Reverted"))
     return;
@@ -538,8 +516,6 @@ function parseCallError(error) {
 
   try {
     if (reason.startsWith("0x08c379a0")) {
-      // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
-      // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
       const parsed = abiCoder.decode(["string"], ethers.getBytes(reason).slice(4))[0];
       newError.message  += `: Error("${parsed}")`;
     }
@@ -549,24 +525,25 @@ function parseCallError(error) {
     }
   } catch (err) {
     fastify.log.error({ err, error }, 'Error parsing call error');
-    return error; // Возвращаем оригинальную ошибку при проблемах с парсингом
+    return error;
   }
 
   return newError;
 }
 
+// Send request to network
 async function sendToNetwork(request, requestId = null) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
     
-    const startTime = Date.now();
     const response = await fetch(PROXY_TO, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        'User-Agent': 'AirDAO-RPC-Proxy/1.0',
-        'X-Request-ID': requestId || crypto.randomUUID()
+        'User-Agent': 'AirDAO-RPC-Proxy/1.1',
+        'X-Request-ID': requestId || crypto.randomUUID(),
+        'Connection': 'keep-alive'
       },
       body: JSON.stringify(request),
       signal: controller.signal
@@ -580,14 +557,13 @@ async function sendToNetwork(request, requestId = null) {
       error.status = response.status;
       error.responseText = errorText;
       
-      // Логируем ошибку с upstream сервера
+      // Log upstream server error
       const errorId = logErrorToFile(
         request,
         { 
           message: `Upstream error: ${response.status} ${response.statusText}`,
           responseText: errorText,
-          status: response.status,
-          duration: Date.now() - startTime
+          status: response.status
         }
       );
       
@@ -600,7 +576,7 @@ async function sendToNetwork(request, requestId = null) {
     if (e.name === 'AbortError') {
       const error = new Error('Network request timeout');
       
-      // Логируем таймаут
+      // Log timeout
       const errorId = logErrorToFile(
         request,
         { message: 'Network request timeout', timeoutMs: TIMEOUT }
@@ -610,11 +586,12 @@ async function sendToNetwork(request, requestId = null) {
       throw error;
     }
     
-    fastify.log.error({ err: e, request }, "Error sending request to network");
+    fastify.log.error({ err: e }, "Error sending request to network");
     throw e;
   }
 }
 
+// Panic reason codes
 const PanicReasons = {
   0x00: "GENERIC_PANIC",
   0x01: "ASSERT_FALSE",
@@ -627,21 +604,29 @@ const PanicReasons = {
   0x41: "OUT_OF_MEMORY",
   0x51: "UNINITIALIZED_FUNCTION_CALL",
 }
-
 // Start the server
 async function main() {
-  // Регистрация плагинов
-  await fastify.register(cors, { origin: '*' });
+  // Register plugins
+  await fastify.register(cors, { 
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS']
+  });
+  
   await fastify.register(websocket, {
     options: {
       maxPayload: MAX_PAYLOAD_SIZE
     }
   });
+  
   await fastify.register(formbody, {
     bodyLimit: MAX_PAYLOAD_SIZE
   });
 
-  // Эндпоинт для проверки здоровья системы
+  // Set server keep-alive timeout
+  fastify.server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT;
+  fastify.server.headersTimeout = HTTP_KEEP_ALIVE_TIMEOUT + 1000;
+
+  // Health check endpoint
   fastify.get('/health', async (request, reply) => {
     const networkCheck = await checkNetworkStatus();
     
@@ -659,21 +644,20 @@ async function main() {
     };
   });
 
-  // Эндпоинт для просмотра метрик
+  // Metrics endpoint
   fastify.get('/metrics', async (request, reply) => {
-    // Обновляем метрики памяти перед отправкой
     metrics.updateMemoryMetrics();
     return metrics.getStats();
   });
 
-  // Эндпоинт для просмотра статистики ошибок
+  // Error stats endpoint
   fastify.get('/errors/stats', async (request, reply) => {
     try {
       if (!fs.existsSync(ERROR_LOG_PATH)) {
         return { count: 0, errors: [] };
       }
       
-      // Группировка ошибок по типам/хешам для более компактного представления
+      // Group errors by type/hash for more compact representation
       const errorFiles = fs.readdirSync(ERROR_LOG_PATH)
         .filter(file => file.endsWith('.json'))
         .map(file => {
@@ -688,11 +672,11 @@ async function main() {
         })
         .sort((a, b) => b.mtime - a.mtime);
       
-      // Хеш-карта для группировки ошибок
+      // Error hash map for grouping
       const errorGroups = new Map();
       const recentErrors = [];
       
-      // Обрабатываем только последние 100 ошибок для статистики
+      // Process only the last 100 errors for statistics
       for (const fileInfo of errorFiles.slice(0, 100)) {
         try {
           const data = JSON.parse(fs.readFileSync(fileInfo.path, 'utf8'));
@@ -715,7 +699,7 @@ async function main() {
           const group = errorGroups.get(groupKey);
           group.count++;
           
-          // Добавляем пример ошибки, если их немного
+          // Add error example if there are few
           if (group.examples.length < 3) {
             group.examples.push({
               id: fileInfo.file.replace('.json', ''),
@@ -724,7 +708,7 @@ async function main() {
             });
           }
           
-          // Отдельно сохраняем самые последние ошибки
+          // Save most recent errors
           if (recentErrors.length < 10) {
             recentErrors.push({
               id: fileInfo.file.replace('.json', ''),
@@ -735,7 +719,7 @@ async function main() {
             });
           }
         } catch (err) {
-          fastify.log.warn({ file: fileInfo.file, err }, 'Failed to parse error log file');
+          fastify.log.warn({ file: fileInfo.file }, 'Failed to parse error log file');
         }
       }
       
@@ -754,7 +738,7 @@ async function main() {
     }
   });
 
-  // Дополнительный эндпоинт для просмотра детальной информации о конкретной ошибке
+  // Detailed error info endpoint
   fastify.get('/errors/:id', async (request, reply) => {
     try {
       const errorId = request.params.id;
@@ -787,19 +771,19 @@ async function main() {
     let reconnectTimer;
     let connectionStartTime = null;
     
-    // Увеличиваем счетчик всех соединений в метриках
+    // Increase connection count in metrics
     metrics.wsConnectionsTotal++;
     metrics.wsConnectionsActive++;
 
     function connectWs() {
-      // Проверяем лимит одновременных попыток подключения
+      // Check parallel connection limit
       if (activeConnectionAttempts >= MAX_PARALLEL_CONNECTIONS) {
         fastify.log.warn(`Too many active connection attempts (${activeConnectionAttempts}), deferring...`);
         setTimeout(connectWs, 1000 + Math.random() * 1000);
         return;
       }
       
-      // Проверяем достижение максимального количества попыток
+      // Check max attempts
       if (connectionAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
         fastify.log.error('Max connection attempts reached for WebSocket connection');
         return;
@@ -808,15 +792,15 @@ async function main() {
       activeConnectionAttempts++;
       metrics.wsReconnectAttempts++;
       
-      // Используем более агрессивный механизм обнаружения разрывов соединения
+      // More aggressive connection break detection
       let isConnected = false;
       let connectionTimer;
       
       connectionAttempts++;
-      // Выбираем текущий эндпоинт на основе индекса
+      // Choose current endpoint based on index
       const wsUrl = RPC_ENDPOINTS[currentEndpointIndex];
       
-      // Обновляем метрики эндпоинта
+      // Update endpoint metrics
       metrics.updateEndpointStats(currentEndpointIndex, false);
       
       fastify.log.info({
@@ -836,26 +820,26 @@ async function main() {
           }
         }
         
-        // Устанавливаем таймер для отмены соединения, если оно не установлено вовремя
+        // Set timer to cancel connection if not established in time
         connectionTimer = setTimeout(() => {
           if (!isConnected && wsClient) {
             fastify.log.warn({ url: wsUrl }, 'Connection timeout, terminating WebSocket');
             try {
               wsClient.terminate();
             } catch (e) {
-              // Игнорируем ошибку при закрытии
+              // Ignore error on close
             }
             activeConnectionAttempts--;
           }
-        }, 5000); // 5 секунд на установление соединения
+        }, 5000);
         
         wsClient = new WebSocket(wsUrl, {
-          handshakeTimeout: 5000, // Уменьшаем таймаут для быстрого обнаружения проблем
+          handshakeTimeout: 5000,
           maxPayload: MAX_PAYLOAD_SIZE,
           perMessageDeflate: false,
           followRedirects: true,
           headers: {
-            'User-Agent': 'AirDAO-RPC-Proxy/1.0'
+            'User-Agent': 'AirDAO-RPC-Proxy/1.1'
           }
         });
         
@@ -867,19 +851,19 @@ async function main() {
           fastify.log.info({ url: wsUrl }, 'Backend WS connected successfully');
           wsReady = true;
           
-          // Обновляем метрики
+          // Update metrics
           metrics.wsConnectionsSuccessful++;
           metrics.updateEndpointStats(currentEndpointIndex, true);
           activeConnectionAttempts--;
           
-          // После успешного подключения сбрасываем счетчик попыток
+          // Reset attempt counter after successful connection
           if (connectionAttempts > 1) {
             fastify.log.info(`Connection successful after ${connectionAttempts} attempts, resetting counter`);
           }
           connectionAttempts = 0;
-          endpointFailureCount = 0; // Сбрасываем счетчик неудач эндпоинта
+          endpointFailureCount = 0; // Reset endpoint failure counter
           
-          // Установка пинг-интервала после успешного подключения
+          // Set ping interval after successful connection
           if (pingInterval) clearInterval(pingInterval);
           pingInterval = setInterval(() => {
             if (wsClient && wsClient.readyState === WebSocket.OPEN) {
@@ -895,7 +879,7 @@ async function main() {
             }
           }, 30000);
           
-          // Для устойчивости, устанавливаем таймер проверки состояния соединения
+          // For robustness, set a timer to check connection state
           if (healthCheckInterval) clearInterval(healthCheckInterval);
           healthCheckInterval = setInterval(() => {
             if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
@@ -920,13 +904,13 @@ async function main() {
         });
 
         wsClient.on('message', (data) => {
-          // Увеличиваем счетчик полученных сообщений
+          // Increase received messages counter
           metrics.wsMessagesReceived++;
           
           if (connection.socket.readyState === WebSocket.OPEN) {
             try {
               const response = JSON.parse(data.toString());
-              // Remove a request from the queue after receiving a response
+              // Remove request from queue after receiving response
               messageQueue.delete(response.id);
               connection.socket.send(data);
               metrics.wsMessagesSent++;
@@ -942,7 +926,7 @@ async function main() {
           clearTimeout(connectionTimer);
           const connectionDuration = connectionStartTime ? (Date.now() - connectionStartTime) / 1000 : 0;
           
-          // Если соединение было коротким, увеличиваем счетчик быстрых разрывов
+          // If connection was short, increase quick disconnect counter
           if (isConnected && connectionDuration < QUICK_DISCONNECT_THRESHOLD) {
             quickDisconnects++;
             metrics.wsQuickDisconnects++;
@@ -953,7 +937,7 @@ async function main() {
               limit: QUICK_DISCONNECT_COUNT_LIMIT
             }, 'Quick disconnect detected');
             
-            // Если много быстрых разрывов, меняем эндпоинт
+            // If many quick disconnects, change endpoint
             if (quickDisconnects >= QUICK_DISCONNECT_COUNT_LIMIT) {
               currentEndpointIndex = (currentEndpointIndex + 1) % RPC_ENDPOINTS.length;
               metrics.currentEndpointIndex = currentEndpointIndex;
@@ -961,10 +945,10 @@ async function main() {
               quickDisconnects = 0;
             }
           } else if (isConnected) {
-            // Если соединение было стабильным какое-то время, уменьшаем счетчик быстрых разрывов
+            // If connection was stable for some time, decrease quick disconnect counter
             quickDisconnects = Math.max(0, quickDisconnects - 1);
             
-            // Сохраняем длительность соединения для метрик
+            // Save connection duration for metrics
             metrics.addWsConnectionDuration(connectionDuration);
           }
           
@@ -989,7 +973,7 @@ async function main() {
         wsClient.on('error', (error) => {
           clearTimeout(connectionTimer);
           
-          // Логирование полной информации об ошибке
+          // Log full error information
           const errorDetails = {
             name: error.name,
             message: error.message,
@@ -1003,10 +987,10 @@ async function main() {
             url: wsUrl
           };
           
-          // Увеличение счетчика ошибок эндпоинта
+          // Increase endpoint error counter
           endpointFailureCount++;
           
-          // Если эндпоинт стабильно не работает, переключаемся на другой
+          // If endpoint consistently fails, switch to another
           if (endpointFailureCount >= 5) {
             currentEndpointIndex = (currentEndpointIndex + 1) % RPC_ENDPOINTS.length;
             metrics.currentEndpointIndex = currentEndpointIndex;
@@ -1019,11 +1003,11 @@ async function main() {
           
           metrics.wsConnectionsFailed++;
           
-          // Сохраняем ошибку в файл для анализа
+          // Save error to file for analysis
           logErrorToFile({ type: 'ws_connection', url: wsUrl }, errorDetails);
           
-          // Если ошибка произошла до подключения, не вызываем событие close
-          // поэтому инициируем переподключение здесь
+          // If error occurred before connection, close event won't fire
+          // so initiate reconnection here
           if (!isConnected) {
             activeConnectionAttempts--;
             reconnect();
@@ -1038,12 +1022,12 @@ async function main() {
       }
     }
 
-    // Функция для обработки переподключения с экспоненциальной задержкой
+    // Reconnect function with exponential backoff
     function reconnect() {
       if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
-        // Используем экспоненциальную задержку с элементом случайности для избежания эффекта "грозди"
+        // Use exponential backoff with random element to avoid thundering herd effect
         const baseDelay = Math.min(1000 * Math.pow(1.5, connectionAttempts), 30000);
-        const jitter = Math.random() * 1000; // Добавляем случайность до 1 секунды
+        const jitter = Math.random() * 1000;
         const timeout = Math.floor(baseDelay + jitter);
         
         fastify.log.info({ timeout, attempt: connectionAttempts + 1 }, `Reconnecting in ${timeout}ms...`);
@@ -1051,15 +1035,15 @@ async function main() {
       } else {
         fastify.log.error('WebSocket reconnection failed after maximum attempts');
         
-        // После достижения максимального количества попыток, устанавливаем длительный таймер
-        // для возможного восстановления соединения в будущем
+        // After reaching max attempts, set a long timer
+        // for possible recovery in future
         fastify.log.info('Scheduling reconnection attempt in 5 minutes');
-        connectionAttempts = 0; // Сбрасываем счетчик для следующего цикла
-        reconnectTimer = setTimeout(connectWs, 5 * 60 * 1000); // 5 минут
+        connectionAttempts = 0; // Reset counter for next cycle
+        reconnectTimer = setTimeout(connectWs, 5 * 60 * 1000);
       }
     }
 
-    // Начинаем установку соединения
+    // Start connection
     connectWs();
 
     connection.socket.on('message', async (data) => {
@@ -1082,7 +1066,7 @@ async function main() {
         const request = JSON.parse(data);
         const requestId = request.id;
 
-        // Check if the request is not already in the queue
+        // Check if request is already in queue
         if (messageQueue.has(requestId)) {
           connection.socket.send(JSON.stringify({
             jsonrpc: '2.0',
@@ -1095,7 +1079,7 @@ async function main() {
           return;
         }
 
-        // Apply the same transformations as for HTTP requests
+        // Apply same transformations as for HTTP requests
         const { userRequest } = prepareUserRequest({ body: request });
         messageQueue.set(requestId, userRequest);
         wsClient.send(JSON.stringify(userRequest));
@@ -1105,7 +1089,7 @@ async function main() {
           if (messageQueue.has(requestId)) {
             messageQueue.delete(requestId);
             if (connection.socket.readyState === WebSocket.OPEN) {
-              // Логируем ошибку таймаута
+              // Log timeout error
               const errorId = logErrorToFile(
                 request, 
                 { code: -32000, message: 'Request timeout', timestamp: new Date().toISOString() }
@@ -1127,7 +1111,7 @@ async function main() {
       } catch (err) {
         fastify.log.error({ err }, 'Error processing WS message');
         
-        // Логируем необработанную ошибку
+        // Log unhandled error
         const rawData = data.toString();
         const requestData = (() => {
           try { return JSON.parse(rawData); } 
@@ -1160,7 +1144,7 @@ async function main() {
       clearTimeout(reconnectTimer);
       messageQueue.clear();
       
-      // Обновляем метрики
+      // Update metrics
       metrics.wsConnectionsActive--;
       
       if (wsClient) {
@@ -1182,5 +1166,5 @@ async function main() {
   }
 }
 
-// Запускаем сервер
+// Start the server
 main();
