@@ -4,16 +4,30 @@ const WebSocket = require('ws');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
+const rateLimit = require('express-rate-limit');
 
 // Configuration
 const PORT = process.env.PORT || 6095;
 const RPC_TARGET = 'https://network.ambrosus.io';
 const WS_TARGET = 'wss://network.ambrosus.io/ws';
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = 5000; // 5 seconds
+const MAX_REQUESTS_PER_SECOND = 150;
+const INACTIVITY_TIMEOUT = 60 * 1000; // 1 minute
 
 // Create Express app
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
+
+// Rate limiting middleware (150 requests per second)
+const limiter = rateLimit({
+  windowMs: 1000, // 1 second
+  max: MAX_REQUESTS_PER_SECOND, // Limit each IP to 150 requests per second
+  message: 'Too many requests, please try again later.'
+});
+
+app.use(limiter);
 
 // Middleware to modify RPC request data
 app.use('/rpc', (req, res, next) => {
@@ -39,6 +53,10 @@ const rpcProxy = createProxyMiddleware({
       proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
       proxyReq.write(bodyData);
     }
+  },
+  onError: (err, req, res) => {
+    console.error('Error during proxy request:', err);
+    res.status(500).send('Internal Server Error');
   }
 });
 
@@ -66,11 +84,11 @@ function setupHeartbeat(ws, name) {
     }
     ws.isAlive = false;
     ws.ping();
-  }, 30000);
+  }, 30000); // Every 30 seconds, ping the client
 }
 
 // Create and manage target WebSocket
-function createTargetWebSocket(ws) {
+function createTargetWebSocket(ws, attempt = 1) {
   const targetWs = new WebSocket(WS_TARGET);
 
   targetWs.on('open', () => {
@@ -89,12 +107,14 @@ function createTargetWebSocket(ws) {
   });
 
   targetWs.on('close', () => {
-    console.log('Target WebSocket closed, reconnecting...');
-    if (ws.readyState === WebSocket.OPEN) {
+    console.log('Target WebSocket closed');
+    if (attempt < MAX_RECONNECT_ATTEMPTS) {
+      console.log(`Reconnecting to target WebSocket (attempt ${attempt + 1})...`);
       setTimeout(() => {
-        const newTarget = createTargetWebSocket(ws);
-        ws._targetWs = newTarget;
-      }, 1000);
+        createTargetWebSocket(ws, attempt + 1);
+      }, RECONNECT_DELAY);
+    } else {
+      console.error('Max reconnect attempts reached. Could not reconnect.');
     }
   });
 
@@ -107,9 +127,20 @@ wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
   setupHeartbeat(ws, 'client');
 
-  ws._targetWs = createTargetWebSocket(ws);
+  // Set up inactivity timer (1 minute)
+  let inactivityTimer = setTimeout(() => {
+    console.log('Client inactive for 1 minute, closing connection...');
+    ws.close();
+  }, INACTIVITY_TIMEOUT);
 
+  // Reset the inactivity timer on each message
   ws.on('message', (message) => {
+    clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      console.log('Client inactive for 1 minute, closing connection...');
+      ws.close();
+    }, INACTIVITY_TIMEOUT);
+
     let parsedMessage;
     try {
       parsedMessage = JSON.parse(message.toString());
@@ -132,8 +163,10 @@ wss.on('connection', (ws) => {
     }
   });
 
+  // Handle client disconnection
   ws.on('close', () => {
     console.log('WebSocket client disconnected');
+    clearTimeout(inactivityTimer); // Clean up inactivity timer
     ws._targetWs.close();
   });
 
@@ -141,6 +174,9 @@ wss.on('connection', (ws) => {
     console.error('WebSocket client error:', error);
     ws._targetWs.close();
   });
+
+  // Create target WebSocket connection
+  ws._targetWs = createTargetWebSocket(ws);
 });
 
 // Start server
