@@ -1,6 +1,5 @@
 const express = require('express');
 const http = require('http');
-const https = require('https');
 const WebSocket = require('ws');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -19,7 +18,6 @@ app.use(bodyParser.json({ limit: '10mb' }));
 // Middleware to modify RPC request data
 app.use('/rpc', (req, res, next) => {
   if (req.body && req.body.params) {
-    // Replace input with data in the request body
     req.body.params = req.body.params.map(param => {
       if (param && param.input) {
         return { ...param, data: param.input, input: undefined };
@@ -35,12 +33,10 @@ const rpcProxy = createProxyMiddleware({
   target: RPC_TARGET,
   changeOrigin: true,
   pathRewrite: { '^/rpc': '' },
-  onProxyReq: (proxyReq, req, res) => {
-    // If the request body was modified, we need to update the content-length header
+  onProxyReq: (proxyReq, req) => {
     if (req.body) {
       const bodyData = JSON.stringify(req.body);
       proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
-      // Write the modified body to the proxy request
       proxyReq.write(bodyData);
     }
   }
@@ -51,51 +47,72 @@ app.use('/rpc', rpcProxy);
 // Create HTTP server
 const server = http.createServer(app);
 
-// Create WebSocket server
+// WebSocket server
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-// Helper function to reconnect WebSocket
-function reconnectWebSocket(ws, targetWs) {
-  if (targetWs.readyState !== WebSocket.OPEN) {
-    console.log('Reconnecting to target WebSocket...');
-    targetWs = new WebSocket(WS_TARGET);
-    
-    targetWs.on('open', () => {
-      console.log('Connected to target WebSocket');
-    });
+// Heartbeat for connections
+function setupHeartbeat(ws, name) {
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
 
-    targetWs.on('message', (message) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(message);
-      }
-    });
-
-    targetWs.on('error', (error) => {
-      console.error('Target WebSocket error:', error);
-      ws.close();
-    });
-
-    targetWs.on('close', () => {
-      console.log('Target WebSocket closed, reconnecting...');
-      reconnectWebSocket(ws, targetWs);
-    });
-  }
+  const interval = setInterval(() => {
+    if (!ws.isAlive) {
+      console.log(`${name} socket not alive, terminating...`);
+      ws.terminate();
+      clearInterval(interval);
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }, 30000);
 }
 
-// Handle WebSocket connections
+// Create and manage target WebSocket
+function createTargetWebSocket(ws) {
+  const targetWs = new WebSocket(WS_TARGET);
+
+  targetWs.on('open', () => {
+    console.log('Connected to target WebSocket');
+  });
+
+  targetWs.on('message', (message) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(message);
+    }
+  });
+
+  targetWs.on('error', (error) => {
+    console.error('Target WebSocket error:', error);
+    if (ws.readyState === WebSocket.OPEN) ws.close();
+  });
+
+  targetWs.on('close', () => {
+    console.log('Target WebSocket closed, reconnecting...');
+    if (ws.readyState === WebSocket.OPEN) {
+      setTimeout(() => {
+        const newTarget = createTargetWebSocket(ws);
+        ws._targetWs = newTarget;
+      }, 1000);
+    }
+  });
+
+  setupHeartbeat(targetWs, 'target');
+  return targetWs;
+}
+
+// Handle client WebSocket connections
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
-  
-  // Create a connection to the target WebSocket server
-  let targetWs = new WebSocket(WS_TARGET);
-  
-  // Handle messages from client
+  setupHeartbeat(ws, 'client');
+
+  ws._targetWs = createTargetWebSocket(ws);
+
   ws.on('message', (message) => {
+    let parsedMessage;
     try {
-      // Parse the message to modify it
-      const parsedMessage = JSON.parse(message.toString());
-      
-      // Replace input with data in the message
+      parsedMessage = JSON.parse(message.toString());
       if (parsedMessage.params) {
         parsedMessage.params = parsedMessage.params.map(param => {
           if (param && param.input) {
@@ -104,54 +121,29 @@ wss.on('connection', (ws) => {
           return param;
         });
       }
-      
-      // Forward the modified message to the target
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify(parsedMessage));
-      } else {
-        reconnectWebSocket(ws, targetWs);
-      }
-    } catch (error) {
-      console.error('Error processing WebSocket message:', error);
-      // Forward the original message if there's an error
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(message);
-      }
+    } catch (err) {
+      console.error('Failed to parse or modify message:', err);
+      parsedMessage = message;
+    }
+
+    const sendData = typeof parsedMessage === 'string' ? parsedMessage : JSON.stringify(parsedMessage);
+    if (ws._targetWs.readyState === WebSocket.OPEN) {
+      ws._targetWs.send(sendData);
     }
   });
-  
-  // Forward messages from target to client
-  targetWs.on('message', (message) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
-    }
-  });
-  
-  // Handle client disconnection
+
   ws.on('close', () => {
     console.log('WebSocket client disconnected');
-    targetWs.close();
+    ws._targetWs.close();
   });
-  
-  // Handle target disconnection
-  targetWs.on('close', () => {
-    console.log('Target WebSocket disconnected');
-    ws.close();
-  });
-  
-  // Handle errors
+
   ws.on('error', (error) => {
     console.error('WebSocket client error:', error);
-    targetWs.close();
-  });
-  
-  targetWs.on('error', (error) => {
-    console.error('Target WebSocket error:', error);
-    ws.close();
+    ws._targetWs.close();
   });
 });
 
-// Start the server
+// Start server
 server.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
 });
