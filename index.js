@@ -6,6 +6,7 @@ const { ethers } = require("ethers");
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 // Настройка логирования
 const fastify = require('fastify')({
@@ -36,10 +37,174 @@ const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
 const PORT = parseInt(process.env.PORT || '8545', 10);
 const TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000', 10);
 const MAX_PAYLOAD_SIZE = parseInt(process.env.MAX_PAYLOAD_SIZE || '10485760', 10); // 10MB
-const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '10', 10);
+const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '20', 10);
 const ERROR_LOG_PATH = process.env.ERROR_LOG_PATH || '/app/logs/errors';
 const MAX_ERROR_LOGS = parseInt(process.env.MAX_ERROR_LOGS || '1000', 10);
 const LOG_ROTATION_INTERVAL = parseInt(process.env.LOG_ROTATION_INTERVAL || '86400000', 10); // 24 часа в мс
+const MAX_PARALLEL_CONNECTIONS = parseInt(process.env.MAX_PARALLEL_CONNECTIONS || '5', 10);
+const HEALTH_CHECK_INTERVAL = parseInt(process.env.HEALTH_CHECK_INTERVAL || '60000', 10);
+
+// Массив альтернативных RPC endpoints для WebSocket
+const RPC_ENDPOINTS = [
+  PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws',
+  'wss://network.ambrosus.io/ws',
+  // Добавьте другие резервные эндпоинты, если они есть
+];
+
+// Метрики для мониторинга
+const metrics = {
+  // HTTP метрики
+  httpRequestsTotal: 0,
+  httpRequestsSuccess: 0,
+  httpRequestsError: 0,
+  httpRequestDurations: [], // последние 100 запросов для расчета среднего времени
+  
+  // WebSocket метрики
+  wsConnectionsTotal: 0,
+  wsConnectionsActive: 0,
+  wsConnectionsSuccessful: 0,
+  wsConnectionsFailed: 0,
+  wsConnectionsDuration: [], // длительность соединений
+  wsMessagesReceived: 0,
+  wsMessagesSent: 0,
+  wsReconnectAttempts: 0,
+  wsQuickDisconnects: 0, // соединения, закрытые менее чем через 5 секунд
+  
+  // Системные метрики
+  startTime: Date.now(),
+  lastMemoryUsage: process.memoryUsage(),
+  memoryUsageHistory: [], // история использования памяти
+  
+  // Эндпоинт метрики
+  currentEndpointIndex: 0,
+  endpointStats: RPC_ENDPOINTS.map(url => ({
+    url,
+    connectAttempts: 0,
+    successfulConnects: 0,
+    failedConnects: 0,
+    totalErrors: 0,
+    lastConnectTime: null,
+    averageConnectionDuration: 0
+  })),
+  
+  // Обновление метрик памяти
+  updateMemoryMetrics: function() {
+    this.lastMemoryUsage = process.memoryUsage();
+    
+    // Хранить историю использования памяти за последний час (с интервалом 1 минута)
+    if (this.memoryUsageHistory.length > 60) {
+      this.memoryUsageHistory.shift();
+    }
+    
+    this.memoryUsageHistory.push({
+      timestamp: Date.now(),
+      rss: Math.round(this.lastMemoryUsage.rss / 1024 / 1024), // MB
+      heapTotal: Math.round(this.lastMemoryUsage.heapTotal / 1024 / 1024), // MB
+      heapUsed: Math.round(this.lastMemoryUsage.heapUsed / 1024 / 1024) // MB
+    });
+  },
+  
+  // Обновление статистики эндпоинта
+  updateEndpointStats: function(index, isConnected, duration = null) {
+    const endpoint = this.endpointStats[index];
+    endpoint.connectAttempts++;
+    
+    if (isConnected) {
+      endpoint.successfulConnects++;
+      endpoint.lastConnectTime = Date.now();
+      
+      if (duration !== null) {
+        // Обновляем среднее время соединения
+        endpoint.averageConnectionDuration = 
+          (endpoint.averageConnectionDuration * (endpoint.successfulConnects - 1) + duration) / 
+          endpoint.successfulConnects;
+      }
+    } else {
+      endpoint.failedConnects++;
+      endpoint.totalErrors++;
+    }
+  },
+  
+  // Добавление длительности HTTP запроса для расчета среднего времени
+  addHttpRequestDuration: function(duration) {
+    if (this.httpRequestDurations.length >= 100) {
+      this.httpRequestDurations.shift();
+    }
+    this.httpRequestDurations.push(duration);
+  },
+  
+  // Добавление длительности WS соединения
+  addWsConnectionDuration: function(duration) {
+    if (this.wsConnectionsDuration.length >= 100) {
+      this.wsConnectionsDuration.shift();
+    }
+    this.wsConnectionsDuration.push(duration);
+  },
+  
+  // Обобщенные метрики
+  getStats: function() {
+    const httpAvgDuration = this.httpRequestDurations.length > 0 
+      ? this.httpRequestDurations.reduce((a, b) => a + b, 0) / this.httpRequestDurations.length
+      : 0;
+      
+    const wsAvgDuration = this.wsConnectionsDuration.length > 0
+      ? this.wsConnectionsDuration.reduce((a, b) => a + b, 0) / this.wsConnectionsDuration.length
+      : 0;
+      
+    return {
+      uptime: Math.floor((Date.now() - this.startTime) / 1000),
+      http: {
+        requestsTotal: this.httpRequestsTotal,
+        requestsSuccess: this.httpRequestsSuccess,
+        requestsError: this.httpRequestsError,
+        successRate: this.httpRequestsTotal > 0 
+          ? (this.httpRequestsSuccess / this.httpRequestsTotal * 100).toFixed(2) + '%' 
+          : '0%',
+        averageRequestDuration: httpAvgDuration.toFixed(2) + 'ms'
+      },
+      websocket: {
+        connectionsTotal: this.wsConnectionsTotal,
+        connectionsActive: this.wsConnectionsActive,
+        connectionsSuccessful: this.wsConnectionsSuccessful,
+        connectionsFailed: this.wsConnectionsFailed,
+        messagesReceived: this.wsMessagesReceived,
+        messagesSent: this.wsMessagesSent,
+        reconnectAttempts: this.wsReconnectAttempts,
+        quickDisconnects: this.wsQuickDisconnects,
+        averageConnectionDuration: wsAvgDuration.toFixed(2) + 's',
+        currentEndpoint: RPC_ENDPOINTS[this.currentEndpointIndex]
+      },
+      system: {
+        memoryUsage: {
+          rss: Math.round(this.lastMemoryUsage.rss / 1024 / 1024) + 'MB',
+          heapTotal: Math.round(this.lastMemoryUsage.heapTotal / 1024 / 1024) + 'MB',
+          heapUsed: Math.round(this.lastMemoryUsage.heapUsed / 1024 / 1024) + 'MB'
+        },
+        cpu: {
+          loadAverage: os.loadavg(),
+          cpus: os.cpus().length
+        },
+        platform: os.platform(),
+        arch: os.arch(),
+        hostname: os.hostname()
+      },
+      endpoints: this.endpointStats
+    };
+  }
+};
+
+// Обновление метрик памяти каждую минуту
+setInterval(() => {
+  metrics.updateMemoryMetrics();
+}, 60000);
+
+// Переменные состояния для механизма переключения между эндпоинтами
+let currentEndpointIndex = 0;
+let endpointFailureCount = 0;
+let activeConnectionAttempts = 0;
+let quickDisconnects = 0;
+const QUICK_DISCONNECT_THRESHOLD = 5; // секунд
+const QUICK_DISCONNECT_COUNT_LIMIT = 10;
 
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
@@ -82,6 +247,27 @@ async function cleanupOldLogs() {
 setInterval(cleanupOldLogs, LOG_ROTATION_INTERVAL);
 // И запустим очистку при старте
 cleanupOldLogs();
+
+// Проверка состояния сети для раннего обнаружения проблем
+async function checkNetworkStatus() {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(PROXY_TO, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'net_version', params: [], id: crypto.randomUUID() }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeout);
+    return response.ok;
+  } catch (err) {
+    fastify.log.error({ err }, 'Network check failed');
+    return false;
+  }
+}
 
 // Функция для логирования ошибок в файл
 function logErrorToFile(requestData, errorData) {
@@ -217,7 +403,12 @@ function prepareUserRequest(request) {
 
 async function handler(request, reply) {
   const originalRequest = request.body;
-  fastify.log.debug({ request: originalRequest }, "Incoming RPC request");
+  const requestId = crypto.randomUUID();
+  const startTime = Date.now();
+  
+  metrics.httpRequestsTotal++;
+  
+  fastify.log.debug({ request: originalRequest, requestId }, "Incoming RPC request");
 
   try {
     const { isArr, userRequest } = prepareUserRequest(request);
@@ -229,13 +420,15 @@ async function handler(request, reply) {
     
     // Выполняем запрос с таймаутом
     const networkResponse = await Promise.race([
-      sendToNetwork(userRequest),
+      sendToNetwork(userRequest, requestId),
       timeoutPromise
     ]);
 
     fastify.log.debug({ 
       request: userRequest,
-      response: networkResponse
+      response: networkResponse,
+      requestId,
+      duration: Date.now() - startTime
     }, "Network response received");
 
     const fixed = await findAndFixErrors(userRequest, networkResponse);
@@ -246,9 +439,16 @@ async function handler(request, reply) {
     });
 
     const response = isArr ? networkResponse : networkResponse[0];
+    
+    metrics.httpRequestsSuccess++;
+    metrics.addHttpRequestDuration(Date.now() - startTime);
+    
     reply.send(response);
   } catch (err) {
-    fastify.log.error({ err, request: originalRequest }, 'Error handling request');
+    metrics.httpRequestsError++;
+    metrics.addHttpRequestDuration(Date.now() - startTime);
+    
+    fastify.log.error({ err, request: originalRequest, requestId, duration: Date.now() - startTime }, 'Error handling request');
     
     // Логируем ошибку с деталями запроса
     const errorId = logErrorToFile(
@@ -258,7 +458,8 @@ async function handler(request, reply) {
         stack: err.stack,
         status: err.status,
         code: err.code,
-        responseText: err.responseText 
+        responseText: err.responseText,
+        duration: Date.now() - startTime
       }
     );
     
@@ -273,7 +474,6 @@ async function handler(request, reply) {
     });
   }
 }
-
 async function findAndFixErrors(request, response) {
   const needToCallTxs = [];
   let fixedReverts = {};
@@ -355,14 +555,19 @@ function parseCallError(error) {
   return newError;
 }
 
-async function sendToNetwork(request) {
+async function sendToNetwork(request, requestId = null) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
     
+    const startTime = Date.now();
     const response = await fetch(PROXY_TO, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'User-Agent': 'AirDAO-RPC-Proxy/1.0',
+        'X-Request-ID': requestId || crypto.randomUUID()
+      },
       body: JSON.stringify(request),
       signal: controller.signal
     });
@@ -381,7 +586,8 @@ async function sendToNetwork(request) {
         { 
           message: `Upstream error: ${response.status} ${response.statusText}`,
           responseText: errorText,
-          status: response.status
+          status: response.status,
+          duration: Date.now() - startTime
         }
       );
       
@@ -421,6 +627,7 @@ const PanicReasons = {
   0x41: "OUT_OF_MEMORY",
   0x51: "UNINITIALIZED_FUNCTION_CALL",
 }
+
 // Start the server
 async function main() {
   // Регистрация плагинов
@@ -436,13 +643,27 @@ async function main() {
 
   // Эндпоинт для проверки здоровья системы
   fastify.get('/health', async (request, reply) => {
+    const networkCheck = await checkNetworkStatus();
+    
     return { 
-      status: 'ok', 
+      status: networkCheck ? 'ok' : 'degraded', 
       timestamp: new Date().toISOString(),
       proxy_to: PROXY_TO,
       uptime: process.uptime(),
-      connections: fastify.websocketServer ? fastify.websocketServer.clients.size : 0
+      connections: {
+        websocket: fastify.websocketServer ? fastify.websocketServer.clients.size : 0,
+        activeAttempts: activeConnectionAttempts
+      },
+      networkStatus: networkCheck ? 'ok' : 'issues detected',
+      currentEndpoint: RPC_ENDPOINTS[currentEndpointIndex]
     };
+  });
+
+  // Эндпоинт для просмотра метрик
+  fastify.get('/metrics', async (request, reply) => {
+    // Обновляем метрики памяти перед отправкой
+    metrics.updateMemoryMetrics();
+    return metrics.getStats();
   });
 
   // Эндпоинт для просмотра статистики ошибок
@@ -564,24 +785,45 @@ async function main() {
     let pingInterval;
     let healthCheckInterval;
     let reconnectTimer;
+    let connectionStartTime = null;
     
+    // Увеличиваем счетчик всех соединений в метриках
+    metrics.wsConnectionsTotal++;
+    metrics.wsConnectionsActive++;
+
     function connectWs() {
+      // Проверяем лимит одновременных попыток подключения
+      if (activeConnectionAttempts >= MAX_PARALLEL_CONNECTIONS) {
+        fastify.log.warn(`Too many active connection attempts (${activeConnectionAttempts}), deferring...`);
+        setTimeout(connectWs, 1000 + Math.random() * 1000);
+        return;
+      }
+      
+      // Проверяем достижение максимального количества попыток
       if (connectionAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
         fastify.log.error('Max connection attempts reached for WebSocket connection');
         return;
       }
 
+      activeConnectionAttempts++;
+      metrics.wsReconnectAttempts++;
+      
       // Используем более агрессивный механизм обнаружения разрывов соединения
       let isConnected = false;
       let connectionTimer;
       
       connectionAttempts++;
-      const wsUrl = PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
+      // Выбираем текущий эндпоинт на основе индекса
+      const wsUrl = RPC_ENDPOINTS[currentEndpointIndex];
+      
+      // Обновляем метрики эндпоинта
+      metrics.updateEndpointStats(currentEndpointIndex, false);
       
       fastify.log.info({
         attempt: connectionAttempts,
         maxAttempts: WS_RECONNECT_MAX_ATTEMPTS,
-        url: wsUrl
+        url: wsUrl,
+        activeAttempts: activeConnectionAttempts
       }, `Attempting to connect to backend WS`);
       
       try {
@@ -603,6 +845,7 @@ async function main() {
             } catch (e) {
               // Игнорируем ошибку при закрытии
             }
+            activeConnectionAttempts--;
           }
         }, 5000); // 5 секунд на установление соединения
         
@@ -617,17 +860,24 @@ async function main() {
         });
         
         wsClient.on('open', () => {
+          connectionStartTime = Date.now();
           isConnected = true;
           clearTimeout(connectionTimer);
           
           fastify.log.info({ url: wsUrl }, 'Backend WS connected successfully');
           wsReady = true;
           
+          // Обновляем метрики
+          metrics.wsConnectionsSuccessful++;
+          metrics.updateEndpointStats(currentEndpointIndex, true);
+          activeConnectionAttempts--;
+          
           // После успешного подключения сбрасываем счетчик попыток
           if (connectionAttempts > 1) {
             fastify.log.info(`Connection successful after ${connectionAttempts} attempts, resetting counter`);
           }
           connectionAttempts = 0;
+          endpointFailureCount = 0; // Сбрасываем счетчик неудач эндпоинта
           
           // Установка пинг-интервала после успешного подключения
           if (pingInterval) clearInterval(pingInterval);
@@ -648,12 +898,12 @@ async function main() {
           // Для устойчивости, устанавливаем таймер проверки состояния соединения
           if (healthCheckInterval) clearInterval(healthCheckInterval);
           healthCheckInterval = setInterval(() => {
-            if (!wsReady || wsClient.readyState !== WebSocket.OPEN) {
+            if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
               fastify.log.warn('WebSocket health check failed, attempting to reconnect');
               clearInterval(healthCheckInterval);
               reconnect();
             }
-          }, 60000);
+          }, HEALTH_CHECK_INTERVAL);
         });
 
         wsClient.on('ping', () => {
@@ -670,12 +920,16 @@ async function main() {
         });
 
         wsClient.on('message', (data) => {
+          // Увеличиваем счетчик полученных сообщений
+          metrics.wsMessagesReceived++;
+          
           if (connection.socket.readyState === WebSocket.OPEN) {
             try {
               const response = JSON.parse(data.toString());
               // Remove a request from the queue after receiving a response
               messageQueue.delete(response.id);
               connection.socket.send(data);
+              metrics.wsMessagesSent++;
             } catch (err) {
               fastify.log.error({ err }, 'Error sending message to client');
             }
@@ -686,11 +940,43 @@ async function main() {
 
         wsClient.on('close', (code, reason) => {
           clearTimeout(connectionTimer);
+          const connectionDuration = connectionStartTime ? (Date.now() - connectionStartTime) / 1000 : 0;
+          
+          // Если соединение было коротким, увеличиваем счетчик быстрых разрывов
+          if (isConnected && connectionDuration < QUICK_DISCONNECT_THRESHOLD) {
+            quickDisconnects++;
+            metrics.wsQuickDisconnects++;
+            
+            fastify.log.warn({ 
+              quickDisconnects, 
+              threshold: QUICK_DISCONNECT_THRESHOLD,
+              limit: QUICK_DISCONNECT_COUNT_LIMIT
+            }, 'Quick disconnect detected');
+            
+            // Если много быстрых разрывов, меняем эндпоинт
+            if (quickDisconnects >= QUICK_DISCONNECT_COUNT_LIMIT) {
+              currentEndpointIndex = (currentEndpointIndex + 1) % RPC_ENDPOINTS.length;
+              metrics.currentEndpointIndex = currentEndpointIndex;
+              fastify.log.info(`Switching to alternate endpoint due to quick disconnects: ${RPC_ENDPOINTS[currentEndpointIndex]}`);
+              quickDisconnects = 0;
+            }
+          } else if (isConnected) {
+            // Если соединение было стабильным какое-то время, уменьшаем счетчик быстрых разрывов
+            quickDisconnects = Math.max(0, quickDisconnects - 1);
+            
+            // Сохраняем длительность соединения для метрик
+            metrics.addWsConnectionDuration(connectionDuration);
+          }
+          
+          if (isConnected) {
+            activeConnectionAttempts--;
+          }
           
           fastify.log.info({ 
             code, 
             reason: reason?.toString() || 'No reason provided',
-            wasConnected: isConnected
+            wasConnected: isConnected,
+            duration: connectionDuration
           }, 'Backend WS closed');
           
           wsReady = false;
@@ -717,8 +1003,21 @@ async function main() {
             url: wsUrl
           };
           
+          // Увеличение счетчика ошибок эндпоинта
+          endpointFailureCount++;
+          
+          // Если эндпоинт стабильно не работает, переключаемся на другой
+          if (endpointFailureCount >= 5) {
+            currentEndpointIndex = (currentEndpointIndex + 1) % RPC_ENDPOINTS.length;
+            metrics.currentEndpointIndex = currentEndpointIndex;
+            fastify.log.info(`Switching to alternate endpoint due to errors: ${RPC_ENDPOINTS[currentEndpointIndex]}`);
+            endpointFailureCount = 0;
+          }
+          
           fastify.log.error({ error: errorDetails }, 'Backend WS error');
           wsReady = false;
+          
+          metrics.wsConnectionsFailed++;
           
           // Сохраняем ошибку в файл для анализа
           logErrorToFile({ type: 'ws_connection', url: wsUrl }, errorDetails);
@@ -726,12 +1025,14 @@ async function main() {
           // Если ошибка произошла до подключения, не вызываем событие close
           // поэтому инициируем переподключение здесь
           if (!isConnected) {
+            activeConnectionAttempts--;
             reconnect();
           }
         });
 
       } catch (err) {
         clearTimeout(connectionTimer);
+        activeConnectionAttempts--;
         fastify.log.error({ err, url: wsUrl }, 'Error creating WebSocket');
         reconnect();
       }
@@ -741,7 +1042,7 @@ async function main() {
     function reconnect() {
       if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
         // Используем экспоненциальную задержку с элементом случайности для избежания эффекта "грозди"
-        const baseDelay = Math.min(1000 * Math.pow(1.5, connectionAttempts), 10000);
+        const baseDelay = Math.min(1000 * Math.pow(1.5, connectionAttempts), 30000);
         const jitter = Math.random() * 1000; // Добавляем случайность до 1 секунды
         const timeout = Math.floor(baseDelay + jitter);
         
@@ -858,6 +1159,9 @@ async function main() {
       clearInterval(healthCheckInterval);
       clearTimeout(reconnectTimer);
       messageQueue.clear();
+      
+      // Обновляем метрики
+      metrics.wsConnectionsActive--;
       
       if (wsClient) {
         try {
