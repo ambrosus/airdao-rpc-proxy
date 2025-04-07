@@ -1,20 +1,65 @@
 const cors = require("@fastify/cors");
 const websocket = require('@fastify/websocket');
+const formbody = require('@fastify/formbody');
 const { WebSocket } = require('ws');
 const { ethers } = require("ethers");
-const fastify = require('fastify')({ logger: true });
 
+const fastify = require('fastify')({
+  logger: {
+    transport: process.env.NODE_ENV === 'development' 
+      ? { target: 'pino-pretty' } 
+      : undefined,
+    level: process.env.LOG_LEVEL || 'info'
+  }
+});
 
 const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
-const PORT = process.env.PORT || 8545;
-
+const PORT = parseInt(process.env.PORT || '8545', 10);
+const TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000', 10);
+const MAX_PAYLOAD_SIZE = parseInt(process.env.MAX_PAYLOAD_SIZE || '10485760', 10); // 10MB
+const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '5', 10);
 
 const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
+async function shutdown() {
+  fastify.log.info('Shutting down gracefully');
+  try {
+    await fastify.close();
+    fastify.log.info('Server closed successfully');
+    process.exit(0);
+  } catch (err) {
+    fastify.log.error('Error during shutdown:', err);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+process.on('uncaughtException', (err) => {
+  fastify.log.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  fastify.log.error('Unhandled rejection:', reason);
+});
+
 // Start the server
 async function main() {
-  await fastify.register(cors, {origin: '*'});
-  await fastify.register(websocket);
+  // Регистрация плагинов
+  await fastify.register(cors, { origin: '*' });
+  await fastify.register(websocket, {
+    options: {
+      maxPayload: MAX_PAYLOAD_SIZE
+    }
+  });
+  await fastify.register(formbody, {
+    bodyLimit: MAX_PAYLOAD_SIZE
+  });
+
+  fastify.get('/health', async (request, reply) => {
+    return { status: 'ok', timestamp: new Date().toISOString() };
+  });
 
   // HTTP handler
   fastify.post('/', handler);
@@ -24,35 +69,58 @@ async function main() {
     let wsClient = null;
     let wsReady = false;
     let connectionAttempts = 0;
-    const maxAttempts = 5;
     const messageQueue = new Map();
+    let pingInterval;
     
     function connectWs() {
-      if (connectionAttempts >= maxAttempts) {
-        console.error('Max connection attempts reached');
+      if (connectionAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
+        fastify.log.error('Max connection attempts reached');
         return;
       }
 
       connectionAttempts++;
       const wsUrl = PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
-      console.log(`Attempting to connect to backend WS (attempt ${connectionAttempts}/${maxAttempts}): ${wsUrl}`);
+      fastify.log.info(`Attempting to connect to backend WS (attempt ${connectionAttempts}/${WS_RECONNECT_MAX_ATTEMPTS}): ${wsUrl}`);
       
       try {
+        if (wsClient && wsClient.readyState !== WebSocket.CLOSED) {
+          try {
+            wsClient.terminate();
+          } catch (err) {
+            fastify.log.error('Error terminating previous WebSocket:', err);
+          }
+        }
+        
         wsClient = new WebSocket(wsUrl, {
           handshakeTimeout: 10000,
-          maxPayload: 100 * 1024 * 1024,
+          maxPayload: MAX_PAYLOAD_SIZE,
           perMessageDeflate: false,
           followRedirects: true
         });
         
         wsClient.on('open', () => {
-          console.log('Backend WS connected successfully');
+          fastify.log.info('Backend WS connected successfully');
           wsReady = true;
           connectionAttempts = 0;
+          
+          if (pingInterval) clearInterval(pingInterval);
+          pingInterval = setInterval(() => {
+            if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+              try {
+                wsClient.ping();
+              } catch (err) {
+                fastify.log.error('Error sending ping:', err);
+              }
+            }
+          }, 30000);
         });
 
         wsClient.on('ping', () => {
-          wsClient.pong();
+          try {
+            wsClient.pong();
+          } catch (err) {
+            fastify.log.error('Error sending pong:', err);
+          }
         });
 
         wsClient.on('message', (data) => {
@@ -63,29 +131,31 @@ async function main() {
               messageQueue.delete(response.id);
               connection.socket.send(data);
             } catch (err) {
-              console.error('Error sending message to client:', err);
+              fastify.log.error('Error sending message to client:', err);
             }
           }
         });
 
         wsClient.on('close', (code, reason) => {
-          console.log('Backend WS closed:', code, reason);
+          fastify.log.info('Backend WS closed:', code, reason);
           wsReady = false;
-          if (connectionAttempts < maxAttempts) {
+          clearInterval(pingInterval);
+          
+          if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
             const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
-            console.log(`Reconnecting in ${timeout}ms...`);
+            fastify.log.info(`Reconnecting in ${timeout}ms...`);
             setTimeout(connectWs, timeout);
           }
         });
 
         wsClient.on('error', (error) => {
-          console.error('Backend WS error:', error);
+          fastify.log.error('Backend WS error:', error);
           wsReady = false;
         });
 
       } catch (err) {
-        console.error('Error creating WebSocket:', err);
-        if (connectionAttempts < maxAttempts) {
+        fastify.log.error('Error creating WebSocket:', err);
+        if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
           const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
           setTimeout(connectWs, timeout);
         }
@@ -94,17 +164,10 @@ async function main() {
 
     connectWs();
 
-    // Keep-alive ping every 30 seconds
-    const pingInterval = setInterval(() => {
-      if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-        wsClient.ping();
-      }
-    }, 30000);
-
     connection.socket.on('message', async (data) => {
       try {
         if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
-          if (!wsReady && connectionAttempts < maxAttempts) {
+          if (!wsReady && connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
             connectWs();
           }
           connection.socket.send(JSON.stringify({
@@ -154,10 +217,10 @@ async function main() {
               }));
             }
           }
-        }, 30000); // 30-second timeout
+        }, TIMEOUT);
 
       } catch (err) {
-        console.error('Error processing WS message:', err);
+        fastify.log.error('Error processing WS message:', err);
         if (connection.socket.readyState === WebSocket.OPEN) {
           connection.socket.send(JSON.stringify({
             jsonrpc: '2.0',
@@ -172,20 +235,27 @@ async function main() {
     });
 
     connection.socket.on('close', () => {
-      console.log('Client disconnected');
+      fastify.log.info('Client disconnected');
       clearInterval(pingInterval);
       messageQueue.clear(); // Clearing the queue on disconnection
       if (wsClient) {
-        wsClient.close();
+        try {
+          wsClient.close();
+        } catch (err) {
+          fastify.log.error('Error closing WebSocket:', err);
+        }
       }
     });
   });
 
-  await fastify.listen({ port: PORT });
-  fastify.log.info(`Listening on port ${PORT}`);
-
+  try {
+    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    fastify.log.info(`Listening on port ${PORT}`);
+  } catch (err) {
+    fastify.log.error('Error starting server:', err);
+    process.exit(1);
+  }
 }
-
 
 function prepareUserRequest(request) {
   const isArr = Array.isArray(request.body);
@@ -201,7 +271,6 @@ function prepareUserRequest(request) {
         delete p?.type; // remix sends this
       }
       delete p?.chainId
-
     });
   });
 
@@ -209,29 +278,50 @@ function prepareUserRequest(request) {
 }
 
 async function handler(request, reply) {
-  console.log("Original user request:", JSON.stringify(request.body, undefined, 4));
+  fastify.log.debug("Original user request:", JSON.stringify(request.body, undefined, 4));
 
-  const { isArr, userRequest } = prepareUserRequest(request);
-  const networkResponse = await sendToNetwork(userRequest);
+  try {
+    const { isArr, userRequest } = prepareUserRequest(request);
+    
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Request timeout')), TIMEOUT)
+    );
+    
+    const networkResponse = await Promise.race([
+      sendToNetwork(userRequest),
+      timeoutPromise
+    ]);
 
-  console.log(JSON.stringify(userRequest, undefined, 4), networkResponse)
+    fastify.log.debug("User request and network response:", 
+      JSON.stringify(userRequest, undefined, 4),
+      JSON.stringify(networkResponse, undefined, 4)
+    );
 
-  const fixed = await findAndFixErrors(userRequest, networkResponse);
+    const fixed = await findAndFixErrors(userRequest, networkResponse);
 
-  networkResponse.forEach((res) => {
-    if (fixed[res.id])
-      res.error = fixed[res.id];
-  })
+    networkResponse.forEach((res) => {
+      if (fixed[res.id])
+        res.error = fixed[res.id];
+    });
 
-  const response = isArr ? networkResponse : networkResponse[0];
-  reply.send(response);
+    const response = isArr ? networkResponse : networkResponse[0];
+    reply.send(response);
+  } catch (err) {
+    fastify.log.error('Error handling request:', err);
+    reply.status(500).send({
+      jsonrpc: '2.0',
+      error: {
+        code: -32000,
+        message: err.message || 'Internal server error'
+      },
+      id: Array.isArray(request.body) ? null : request.body?.id
+    });
+  }
 }
 
-
 async function findAndFixErrors(request, response) {
-
   const needToCallTxs = [];
-  let fixedReverts = {  };
+  let fixedReverts = {};
 
   for (const res of response) {
     if (!res.error) continue;
@@ -241,10 +331,10 @@ async function findAndFixErrors(request, response) {
 
     // if it was a gas estimation or raw tx, we need to make a call to get the revert reason
     if (req.method === "eth_estimateGas" || req.method === "eth_sendRawTransaction") {
-      if (res.error.data.startsWith("Reverted")) {
+      if (res.error.data && res.error.data.startsWith("Reverted")) {
         needToCallTxs.push({ ...req, method: "eth_call" });
       }
-      if (res.error.data.includes("Bad instruction")) {
+      else if (res.error.data && res.error.data.includes("Bad instruction")) {
         fixedReverts[res.id] = {
           code: res.error.code,
           message: `${res.error.data}. Most likely you need to change EVM version. Check documentation: https://docs.airdao.io/build-on-airdao/smart-contract-overview`,
@@ -252,35 +342,32 @@ async function findAndFixErrors(request, response) {
         }
       }
       else {
-        console.warn("Error, not fixed", res);
+        fastify.log.warn("Error, not fixed", res);
       }
     }
-
     // if it was a call, we need to parse the revert reason
     else if (req.method === "eth_call") {
       const fixedError = parseCallError(res.error);
       if (!fixedError) {
-        console.warn("Can't parse error", res);
+        fastify.log.warn("Can't parse error", res);
         continue;
       }
 
       fixedReverts[res.id] = fixedError;
     }
-
-
   }
-
 
   if (needToCallTxs.length > 0) {
-    const anotherFixedReverts = await findAndFixErrors(needToCallTxs, await sendToNetwork(needToCallTxs));
-    fixedReverts = { ...fixedReverts, ...anotherFixedReverts };
+    try {
+      const anotherFixedReverts = await findAndFixErrors(needToCallTxs, await sendToNetwork(needToCallTxs));
+      fixedReverts = { ...fixedReverts, ...anotherFixedReverts };
+    } catch (err) {
+      fastify.log.error('Error finding and fixing errors:', err);
+    }
   }
 
-
   return fixedReverts;
-
 }
-
 
 function parseCallError(error) {
   if (!error?.data?.startsWith("Reverted"))
@@ -294,38 +381,49 @@ function parseCallError(error) {
     data: reason
   }
 
-
-  if (reason.startsWith("0x08c379a0")) {
-    // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
-    // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
-    const parsed = abiCoder.decode(["string"], ethers.getBytes(reason).slice(4))[0];
-    newError.message  += `: Error("${parsed}")`;
-  }
-  else if (reason.startsWith("0x4e487b71")) {
-    const code = Number(abiCoder.decode(["uint256"], ethers.getBytes(reason).slice(4))[0]);
-    newError.message += `: Panic(${code}) (${PanicReasons[code] ?? "Unknown panic code"})`;
+  try {
+    if (reason.startsWith("0x08c379a0")) {
+      // https://github.com/authereum/eth-revert-reason/blob/e33f4df82426a177dbd69c0f97ff53153592809b/index.js#L93
+      // "0x08c379a0" is `Error(string)` method signature, it's called by revert/require
+      const parsed = abiCoder.decode(["string"], ethers.getBytes(reason).slice(4))[0];
+      newError.message  += `: Error("${parsed}")`;
+    }
+    else if (reason.startsWith("0x4e487b71")) {
+      const code = Number(abiCoder.decode(["uint256"], ethers.getBytes(reason).slice(4))[0]);
+      newError.message += `: Panic(${code}) (${PanicReasons[code] ?? "Unknown panic code"})`;
+    }
+  } catch (err) {
+    fastify.log.error('Error parsing call error:', err);
+    return error;
   }
 
   return newError;
 }
 
-
-
 async function sendToNetwork(request) {
-  const response = await fetch(PROXY_TO, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
+    
+    const response = await fetch(PROXY_TO, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
     return response.json();
   } catch (e) {
-    console.error("Error parsing response from original rpc", await response.text());
-    throw e;
+    if (e.name === 'AbortError') {
+      throw new Error('Network request timeout');
+    }
+    
+    fastify.log.error("Error sending request to network:", e);
+    throw new Error('Network request failed: ' + e.message);
   }
 }
-
 
 const PanicReasons = {
   0x00: "GENERIC_PANIC",
