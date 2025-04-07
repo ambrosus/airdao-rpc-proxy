@@ -36,7 +36,7 @@ const PROXY_TO = process.env.PROXY_TO || 'https://network.ambrosus-dev.io';
 const PORT = parseInt(process.env.PORT || '8545', 10);
 const TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000', 10);
 const MAX_PAYLOAD_SIZE = parseInt(process.env.MAX_PAYLOAD_SIZE || '10485760', 10); // 10MB
-const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '5', 10);
+const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS || '10', 10);
 const ERROR_LOG_PATH = process.env.ERROR_LOG_PATH || '/app/logs/errors';
 const MAX_ERROR_LOGS = parseInt(process.env.MAX_ERROR_LOGS || '1000', 10);
 const LOG_ROTATION_INTERVAL = parseInt(process.env.LOG_ROTATION_INTERVAL || '86400000', 10); // 24 часа в мс
@@ -195,371 +195,6 @@ process.on('unhandledRejection', (reason) => {
   fastify.log.error({ reason }, 'Unhandled rejection');
 });
 
-// Start the server
-async function main() {
-  // Регистрация плагинов
-  await fastify.register(cors, { origin: '*' });
-  await fastify.register(websocket, {
-    options: {
-      maxPayload: MAX_PAYLOAD_SIZE
-    }
-  });
-  await fastify.register(formbody, {
-    bodyLimit: MAX_PAYLOAD_SIZE
-  });
-
-  // Эндпоинт для проверки здоровья системы
-  fastify.get('/health', async (request, reply) => {
-    return { 
-      status: 'ok', 
-      timestamp: new Date().toISOString(),
-      proxy_to: PROXY_TO,
-      uptime: process.uptime(),
-      connections: fastify.websocketServer ? fastify.websocketServer.clients.size : 0
-    };
-  });
-
-  // Эндпоинт для просмотра статистики ошибок
-  fastify.get('/errors/stats', async (request, reply) => {
-    try {
-      if (!fs.existsSync(ERROR_LOG_PATH)) {
-        return { count: 0, errors: [] };
-      }
-      
-      // Группировка ошибок по типам/хешам для более компактного представления
-      const errorFiles = fs.readdirSync(ERROR_LOG_PATH)
-        .filter(file => file.endsWith('.json'))
-        .map(file => {
-          const filePath = path.join(ERROR_LOG_PATH, file);
-          const stats = fs.statSync(filePath);
-          return { 
-            file,
-            path: filePath,
-            mtime: stats.mtime.getTime(),
-            size: stats.size
-          };
-        })
-        .sort((a, b) => b.mtime - a.mtime);
-      
-      // Хеш-карта для группировки ошибок
-      const errorGroups = new Map();
-      const recentErrors = [];
-      
-      // Обрабатываем только последние 100 ошибок для статистики
-      for (const fileInfo of errorFiles.slice(0, 100)) {
-        try {
-          const data = JSON.parse(fs.readFileSync(fileInfo.path, 'utf8'));
-          const requestMethod = Array.isArray(data.request) 
-            ? data.request.map(r => r.method).join(',')
-            : (data.request?.method || 'unknown');
-          
-          const errorMessage = data.error?.message || 'unknown error';
-          const groupKey = `${requestMethod}:${errorMessage.substring(0, 50)}`;
-          
-          if (!errorGroups.has(groupKey)) {
-            errorGroups.set(groupKey, {
-              method: requestMethod,
-              error: errorMessage,
-              count: 0,
-              examples: []
-            });
-          }
-          
-          const group = errorGroups.get(groupKey);
-          group.count++;
-          
-          // Добавляем пример ошибки, если их немного
-          if (group.examples.length < 3) {
-            group.examples.push({
-              id: fileInfo.file.replace('.json', ''),
-              timestamp: data.timestamp,
-              requestHash: data.requestHash
-            });
-          }
-          
-          // Отдельно сохраняем самые последние ошибки
-          if (recentErrors.length < 10) {
-            recentErrors.push({
-              id: fileInfo.file.replace('.json', ''),
-              timestamp: data.timestamp,
-              method: requestMethod,
-              error: errorMessage,
-              requestHash: data.requestHash
-            });
-          }
-        } catch (err) {
-          fastify.log.warn({ file: fileInfo.file, err }, 'Failed to parse error log file');
-        }
-      }
-      
-      return { 
-        count: errorFiles.length, 
-        totalFiles: errorFiles.length,
-        diskUsage: errorFiles.reduce((sum, file) => sum + file.size, 0),
-        groups: Array.from(errorGroups.values())
-          .sort((a, b) => b.count - a.count)
-          .slice(0, 20),
-        recentErrors
-      };
-    } catch (err) {
-      fastify.log.error({ err }, 'Error getting error stats');
-      return { error: 'Failed to get error statistics', message: err.message };
-    }
-  });
-
-  // Дополнительный эндпоинт для просмотра детальной информации о конкретной ошибке
-  fastify.get('/errors/:id', async (request, reply) => {
-    try {
-      const errorId = request.params.id;
-      const errorFilePath = path.join(ERROR_LOG_PATH, `${errorId}.json`);
-      
-      if (!fs.existsSync(errorFilePath)) {
-        reply.status(404).send({ error: 'Error log not found' });
-        return;
-      }
-      
-      const errorData = JSON.parse(fs.readFileSync(errorFilePath, 'utf8'));
-      return errorData;
-    } catch (err) {
-      fastify.log.error({ err, errorId: request.params.id }, 'Error retrieving error log');
-      reply.status(500).send({ error: 'Failed to retrieve error log' });
-    }
-  });
-
-  // HTTP handler
-  fastify.post('/', handler);
-
-  // WebSocket handler
-  fastify.get('/ws', { websocket: true }, (connection, req) => {
-    let wsClient = null;
-    let wsReady = false;
-    let connectionAttempts = 0;
-    const messageQueue = new Map();
-    let pingInterval;
-    
-    function connectWs() {
-      if (connectionAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
-        fastify.log.error('Max connection attempts reached');
-        return;
-      }
-
-      connectionAttempts++;
-      const wsUrl = PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
-      fastify.log.info(`Attempting to connect to backend WS (attempt ${connectionAttempts}/${WS_RECONNECT_MAX_ATTEMPTS}): ${wsUrl}`);
-      
-      try {
-        if (wsClient && wsClient.readyState !== WebSocket.CLOSED) {
-          try {
-            wsClient.terminate();
-          } catch (err) {
-            fastify.log.error({ err }, 'Error terminating previous WebSocket');
-          }
-        }
-        
-        wsClient = new WebSocket(wsUrl, {
-          handshakeTimeout: 10000,
-          maxPayload: MAX_PAYLOAD_SIZE,
-          perMessageDeflate: false,
-          followRedirects: true
-        });
-        
-        wsClient.on('open', () => {
-          fastify.log.info('Backend WS connected successfully');
-          wsReady = true;
-          connectionAttempts = 0;
-          
-          // Установка пинг-интервала после успешного подключения
-          if (pingInterval) clearInterval(pingInterval);
-          pingInterval = setInterval(() => {
-            if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-              try {
-                wsClient.ping();
-              } catch (err) {
-                fastify.log.error({ err }, 'Error sending ping');
-              }
-            }
-          }, 30000);
-        });
-
-        wsClient.on('ping', () => {
-          try {
-            wsClient.pong();
-          } catch (err) {
-            fastify.log.error({ err }, 'Error sending pong');
-          }
-        });
-
-        wsClient.on('message', (data) => {
-          if (connection.socket.readyState === WebSocket.OPEN) {
-            try {
-              const response = JSON.parse(data.toString());
-              // Remove a request from the queue after receiving a response
-              messageQueue.delete(response.id);
-              connection.socket.send(data);
-            } catch (err) {
-              fastify.log.error({ err }, 'Error sending message to client');
-            }
-          }
-        });
-
-        wsClient.on('close', (code, reason) => {
-          fastify.log.info({ code, reason: reason?.toString() }, 'Backend WS closed');
-          wsReady = false;
-          clearInterval(pingInterval);
-          
-          if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
-            const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
-            fastify.log.info(`Reconnecting in ${timeout}ms...`);
-            setTimeout(connectWs, timeout);
-          }
-        });
-
-        wsClient.on('error', (error) => {
-          // Логирование полной информации об ошибке
-          const errorDetails = {
-            name: error.name,
-            message: error.message,
-            code: error.code,
-            type: error.type,
-            errno: error.errno,
-            syscall: error.syscall,
-            hostname: error.hostname,
-            address: error.address,
-            port: error.port
-          };
-          
-          fastify.log.error({ error: errorDetails }, 'Backend WS error');
-          wsReady = false;
-          
-          // Сохраняем ошибку в файл для анализа
-          logErrorToFile({ type: 'ws_connection', url: wsUrl }, errorDetails);
-        });
-
-      } catch (err) {
-        fastify.log.error({ err }, 'Error creating WebSocket');
-        if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
-          const timeout = Math.min(1000 * Math.pow(2, connectionAttempts), 10000);
-          setTimeout(connectWs, timeout);
-        }
-      }
-    }
-
-    connectWs();
-
-    connection.socket.on('message', async (data) => {
-      try {
-        if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
-          if (!wsReady && connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
-            connectWs();
-          }
-          connection.socket.send(JSON.stringify({
-            jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message: 'Backend WebSocket is not connected. Please try again in a few seconds.'
-            },
-            id: JSON.parse(data)?.id || null
-          }));
-          return;
-        }
-
-        const request = JSON.parse(data);
-        const requestId = request.id;
-
-        // Check if the request is not already in the queue
-        if (messageQueue.has(requestId)) {
-          connection.socket.send(JSON.stringify({
-            jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message: 'Request with this ID is already in progress'
-            },
-            id: requestId
-          }));
-          return;
-        }
-
-        // Apply the same transformations as for HTTP requests
-        const { userRequest } = prepareUserRequest({ body: request });
-        messageQueue.set(requestId, userRequest);
-        wsClient.send(JSON.stringify(userRequest));
-
-        // Timeout for request
-        setTimeout(() => {
-          if (messageQueue.has(requestId)) {
-            messageQueue.delete(requestId);
-            if (connection.socket.readyState === WebSocket.OPEN) {
-              // Логируем ошибку таймаута
-              const errorId = logErrorToFile(
-                request, 
-                { code: -32000, message: 'Request timeout', timestamp: new Date().toISOString() }
-              );
-
-              connection.socket.send(JSON.stringify({
-                jsonrpc: '2.0',
-                error: {
-                  code: -32000,
-                  message: 'Request timeout',
-                  data: errorId ? `Error ID: ${errorId}` : undefined
-                },
-                id: requestId
-              }));
-            }
-          }
-        }, TIMEOUT);
-
-      } catch (err) {
-        fastify.log.error({ err }, 'Error processing WS message');
-        
-        // Логируем необработанную ошибку
-        const rawData = data.toString();
-        const requestData = (() => {
-          try { return JSON.parse(rawData); } 
-          catch { return rawData; }
-        })();
-        
-        const errorId = logErrorToFile(
-          requestData, 
-          { code: -32000, message: err.message, stack: err.stack }
-        );
-
-        if (connection.socket.readyState === WebSocket.OPEN) {
-          connection.socket.send(JSON.stringify({
-            jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message: 'Internal server error',
-              data: errorId ? `Error ID: ${errorId}` : undefined
-            },
-            id: null
-          }));
-        }
-      }
-    });
-
-    connection.socket.on('close', () => {
-      fastify.log.info('Client disconnected');
-      clearInterval(pingInterval);
-      messageQueue.clear(); // Clearing the queue on disconnection
-      if (wsClient) {
-        try {
-          wsClient.close();
-        } catch (err) {
-          fastify.log.error({ err }, 'Error closing WebSocket');
-        }
-      }
-    });
-  });
-
-  try {
-    await fastify.listen({ port: PORT, host: '0.0.0.0' });
-    fastify.log.info(`Listening on port ${PORT}, proxying to ${PROXY_TO}`);
-  } catch (err) {
-    fastify.log.error({ err }, 'Error starting server');
-    process.exit(1);
-  }
-}
-
 function prepareUserRequest(request) {
   const isArr = Array.isArray(request.body);
   const userRequest = isArr ? request.body : [request.body];
@@ -627,8 +262,7 @@ async function handler(request, reply) {
       }
     );
     
-    // Устанавливаем HTTP статус 502 для Bad Gateway, чтобы Nginx мог сделать фолбек
-    reply.status(502).send({
+    reply.status(500).send({
       jsonrpc: '2.0',
       error: {
         code: -32000,
@@ -786,6 +420,462 @@ const PanicReasons = {
   0x32: "ARRAY_RANGE_ERROR",
   0x41: "OUT_OF_MEMORY",
   0x51: "UNINITIALIZED_FUNCTION_CALL",
+}
+// Start the server
+async function main() {
+  // Регистрация плагинов
+  await fastify.register(cors, { origin: '*' });
+  await fastify.register(websocket, {
+    options: {
+      maxPayload: MAX_PAYLOAD_SIZE
+    }
+  });
+  await fastify.register(formbody, {
+    bodyLimit: MAX_PAYLOAD_SIZE
+  });
+
+  // Эндпоинт для проверки здоровья системы
+  fastify.get('/health', async (request, reply) => {
+    return { 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      proxy_to: PROXY_TO,
+      uptime: process.uptime(),
+      connections: fastify.websocketServer ? fastify.websocketServer.clients.size : 0
+    };
+  });
+
+  // Эндпоинт для просмотра статистики ошибок
+  fastify.get('/errors/stats', async (request, reply) => {
+    try {
+      if (!fs.existsSync(ERROR_LOG_PATH)) {
+        return { count: 0, errors: [] };
+      }
+      
+      // Группировка ошибок по типам/хешам для более компактного представления
+      const errorFiles = fs.readdirSync(ERROR_LOG_PATH)
+        .filter(file => file.endsWith('.json'))
+        .map(file => {
+          const filePath = path.join(ERROR_LOG_PATH, file);
+          const stats = fs.statSync(filePath);
+          return { 
+            file,
+            path: filePath,
+            mtime: stats.mtime.getTime(),
+            size: stats.size
+          };
+        })
+        .sort((a, b) => b.mtime - a.mtime);
+      
+      // Хеш-карта для группировки ошибок
+      const errorGroups = new Map();
+      const recentErrors = [];
+      
+      // Обрабатываем только последние 100 ошибок для статистики
+      for (const fileInfo of errorFiles.slice(0, 100)) {
+        try {
+          const data = JSON.parse(fs.readFileSync(fileInfo.path, 'utf8'));
+          const requestMethod = Array.isArray(data.request) 
+            ? data.request.map(r => r.method).join(',')
+            : (data.request?.method || 'unknown');
+          
+          const errorMessage = data.error?.message || 'unknown error';
+          const groupKey = `${requestMethod}:${errorMessage.substring(0, 50)}`;
+          
+          if (!errorGroups.has(groupKey)) {
+            errorGroups.set(groupKey, {
+              method: requestMethod,
+              error: errorMessage,
+              count: 0,
+              examples: []
+            });
+          }
+          
+          const group = errorGroups.get(groupKey);
+          group.count++;
+          
+          // Добавляем пример ошибки, если их немного
+          if (group.examples.length < 3) {
+            group.examples.push({
+              id: fileInfo.file.replace('.json', ''),
+              timestamp: data.timestamp,
+              requestHash: data.requestHash
+            });
+          }
+          
+          // Отдельно сохраняем самые последние ошибки
+          if (recentErrors.length < 10) {
+            recentErrors.push({
+              id: fileInfo.file.replace('.json', ''),
+              timestamp: data.timestamp,
+              method: requestMethod,
+              error: errorMessage,
+              requestHash: data.requestHash
+            });
+          }
+        } catch (err) {
+          fastify.log.warn({ file: fileInfo.file, err }, 'Failed to parse error log file');
+        }
+      }
+      
+      return { 
+        count: errorFiles.length, 
+        totalFiles: errorFiles.length,
+        diskUsage: errorFiles.reduce((sum, file) => sum + file.size, 0),
+        groups: Array.from(errorGroups.values())
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 20),
+        recentErrors
+      };
+    } catch (err) {
+      fastify.log.error({ err }, 'Error getting error stats');
+      return { error: 'Failed to get error statistics', message: err.message };
+    }
+  });
+
+  // Дополнительный эндпоинт для просмотра детальной информации о конкретной ошибке
+  fastify.get('/errors/:id', async (request, reply) => {
+    try {
+      const errorId = request.params.id;
+      const errorFilePath = path.join(ERROR_LOG_PATH, `${errorId}.json`);
+      
+      if (!fs.existsSync(errorFilePath)) {
+        reply.status(404).send({ error: 'Error log not found' });
+        return;
+      }
+      
+      const errorData = JSON.parse(fs.readFileSync(errorFilePath, 'utf8'));
+      return errorData;
+    } catch (err) {
+      fastify.log.error({ err, errorId: request.params.id }, 'Error retrieving error log');
+      reply.status(500).send({ error: 'Failed to retrieve error log' });
+    }
+  });
+
+  // HTTP handler
+  fastify.post('/', handler);
+
+  // WebSocket handler
+  fastify.get('/ws', { websocket: true }, (connection, req) => {
+    let wsClient = null;
+    let wsReady = false;
+    let connectionAttempts = 0;
+    const messageQueue = new Map();
+    let pingInterval;
+    let healthCheckInterval;
+    let reconnectTimer;
+    
+    function connectWs() {
+      if (connectionAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
+        fastify.log.error('Max connection attempts reached for WebSocket connection');
+        return;
+      }
+
+      // Используем более агрессивный механизм обнаружения разрывов соединения
+      let isConnected = false;
+      let connectionTimer;
+      
+      connectionAttempts++;
+      const wsUrl = PROXY_TO.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
+      
+      fastify.log.info({
+        attempt: connectionAttempts,
+        maxAttempts: WS_RECONNECT_MAX_ATTEMPTS,
+        url: wsUrl
+      }, `Attempting to connect to backend WS`);
+      
+      try {
+        if (wsClient && wsClient.readyState !== WebSocket.CLOSED) {
+          try {
+            wsClient.terminate();
+            fastify.log.info('Previous WebSocket terminated');
+          } catch (err) {
+            fastify.log.error({ err }, 'Error terminating previous WebSocket');
+          }
+        }
+        
+        // Устанавливаем таймер для отмены соединения, если оно не установлено вовремя
+        connectionTimer = setTimeout(() => {
+          if (!isConnected && wsClient) {
+            fastify.log.warn({ url: wsUrl }, 'Connection timeout, terminating WebSocket');
+            try {
+              wsClient.terminate();
+            } catch (e) {
+              // Игнорируем ошибку при закрытии
+            }
+          }
+        }, 5000); // 5 секунд на установление соединения
+        
+        wsClient = new WebSocket(wsUrl, {
+          handshakeTimeout: 5000, // Уменьшаем таймаут для быстрого обнаружения проблем
+          maxPayload: MAX_PAYLOAD_SIZE,
+          perMessageDeflate: false,
+          followRedirects: true,
+          headers: {
+            'User-Agent': 'AirDAO-RPC-Proxy/1.0'
+          }
+        });
+        
+        wsClient.on('open', () => {
+          isConnected = true;
+          clearTimeout(connectionTimer);
+          
+          fastify.log.info({ url: wsUrl }, 'Backend WS connected successfully');
+          wsReady = true;
+          
+          // После успешного подключения сбрасываем счетчик попыток
+          if (connectionAttempts > 1) {
+            fastify.log.info(`Connection successful after ${connectionAttempts} attempts, resetting counter`);
+          }
+          connectionAttempts = 0;
+          
+          // Установка пинг-интервала после успешного подключения
+          if (pingInterval) clearInterval(pingInterval);
+          pingInterval = setInterval(() => {
+            if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+              try {
+                fastify.log.debug('Sending ping to backend WebSocket');
+                wsClient.ping();
+              } catch (err) {
+                fastify.log.error({ err }, 'Error sending ping');
+              }
+            } else {
+              fastify.log.warn('Ping interval running but WebSocket not open, cleaning up');
+              clearInterval(pingInterval);
+            }
+          }, 30000);
+          
+          // Для устойчивости, устанавливаем таймер проверки состояния соединения
+          if (healthCheckInterval) clearInterval(healthCheckInterval);
+          healthCheckInterval = setInterval(() => {
+            if (!wsReady || wsClient.readyState !== WebSocket.OPEN) {
+              fastify.log.warn('WebSocket health check failed, attempting to reconnect');
+              clearInterval(healthCheckInterval);
+              reconnect();
+            }
+          }, 60000);
+        });
+
+        wsClient.on('ping', () => {
+          try {
+            wsClient.pong();
+            fastify.log.debug('Responded to ping from server');
+          } catch (err) {
+            fastify.log.error({ err }, 'Error sending pong');
+          }
+        });
+        
+        wsClient.on('pong', () => {
+          fastify.log.debug('Received pong from server');
+        });
+
+        wsClient.on('message', (data) => {
+          if (connection.socket.readyState === WebSocket.OPEN) {
+            try {
+              const response = JSON.parse(data.toString());
+              // Remove a request from the queue after receiving a response
+              messageQueue.delete(response.id);
+              connection.socket.send(data);
+            } catch (err) {
+              fastify.log.error({ err }, 'Error sending message to client');
+            }
+          } else {
+            fastify.log.warn('Received message from backend but client socket not open');
+          }
+        });
+
+        wsClient.on('close', (code, reason) => {
+          clearTimeout(connectionTimer);
+          
+          fastify.log.info({ 
+            code, 
+            reason: reason?.toString() || 'No reason provided',
+            wasConnected: isConnected
+          }, 'Backend WS closed');
+          
+          wsReady = false;
+          clearInterval(pingInterval);
+          clearInterval(healthCheckInterval);
+          
+          reconnect();
+        });
+
+        wsClient.on('error', (error) => {
+          clearTimeout(connectionTimer);
+          
+          // Логирование полной информации об ошибке
+          const errorDetails = {
+            name: error.name,
+            message: error.message,
+            code: error.code,
+            type: error.type,
+            errno: error.errno,
+            syscall: error.syscall,
+            hostname: error.hostname,
+            address: error.address,
+            port: error.port,
+            url: wsUrl
+          };
+          
+          fastify.log.error({ error: errorDetails }, 'Backend WS error');
+          wsReady = false;
+          
+          // Сохраняем ошибку в файл для анализа
+          logErrorToFile({ type: 'ws_connection', url: wsUrl }, errorDetails);
+          
+          // Если ошибка произошла до подключения, не вызываем событие close
+          // поэтому инициируем переподключение здесь
+          if (!isConnected) {
+            reconnect();
+          }
+        });
+
+      } catch (err) {
+        clearTimeout(connectionTimer);
+        fastify.log.error({ err, url: wsUrl }, 'Error creating WebSocket');
+        reconnect();
+      }
+    }
+
+    // Функция для обработки переподключения с экспоненциальной задержкой
+    function reconnect() {
+      if (connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
+        // Используем экспоненциальную задержку с элементом случайности для избежания эффекта "грозди"
+        const baseDelay = Math.min(1000 * Math.pow(1.5, connectionAttempts), 10000);
+        const jitter = Math.random() * 1000; // Добавляем случайность до 1 секунды
+        const timeout = Math.floor(baseDelay + jitter);
+        
+        fastify.log.info({ timeout, attempt: connectionAttempts + 1 }, `Reconnecting in ${timeout}ms...`);
+        reconnectTimer = setTimeout(connectWs, timeout);
+      } else {
+        fastify.log.error('WebSocket reconnection failed after maximum attempts');
+        
+        // После достижения максимального количества попыток, устанавливаем длительный таймер
+        // для возможного восстановления соединения в будущем
+        fastify.log.info('Scheduling reconnection attempt in 5 minutes');
+        connectionAttempts = 0; // Сбрасываем счетчик для следующего цикла
+        reconnectTimer = setTimeout(connectWs, 5 * 60 * 1000); // 5 минут
+      }
+    }
+
+    // Начинаем установку соединения
+    connectWs();
+
+    connection.socket.on('message', async (data) => {
+      try {
+        if (!wsReady || !wsClient || wsClient.readyState !== WebSocket.OPEN) {
+          if (!wsReady && connectionAttempts < WS_RECONNECT_MAX_ATTEMPTS) {
+            connectWs();
+          }
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Backend WebSocket is not connected. Please try again in a few seconds.'
+            },
+            id: JSON.parse(data)?.id || null
+          }));
+          return;
+        }
+
+        const request = JSON.parse(data);
+        const requestId = request.id;
+
+        // Check if the request is not already in the queue
+        if (messageQueue.has(requestId)) {
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Request with this ID is already in progress'
+            },
+            id: requestId
+          }));
+          return;
+        }
+
+        // Apply the same transformations as for HTTP requests
+        const { userRequest } = prepareUserRequest({ body: request });
+        messageQueue.set(requestId, userRequest);
+        wsClient.send(JSON.stringify(userRequest));
+
+        // Timeout for request
+        setTimeout(() => {
+          if (messageQueue.has(requestId)) {
+            messageQueue.delete(requestId);
+            if (connection.socket.readyState === WebSocket.OPEN) {
+              // Логируем ошибку таймаута
+              const errorId = logErrorToFile(
+                request, 
+                { code: -32000, message: 'Request timeout', timestamp: new Date().toISOString() }
+              );
+
+              connection.socket.send(JSON.stringify({
+                jsonrpc: '2.0',
+                error: {
+                  code: -32000,
+                  message: 'Request timeout',
+                  data: errorId ? `Error ID: ${errorId}` : undefined
+                },
+                id: requestId
+              }));
+            }
+          }
+        }, TIMEOUT);
+
+      } catch (err) {
+        fastify.log.error({ err }, 'Error processing WS message');
+        
+        // Логируем необработанную ошибку
+        const rawData = data.toString();
+        const requestData = (() => {
+          try { return JSON.parse(rawData); } 
+          catch { return rawData; }
+        })();
+        
+        const errorId = logErrorToFile(
+          requestData, 
+          { code: -32000, message: err.message, stack: err.stack }
+        );
+
+        if (connection.socket.readyState === WebSocket.OPEN) {
+          connection.socket.send(JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Internal server error',
+              data: errorId ? `Error ID: ${errorId}` : undefined
+            },
+            id: null
+          }));
+        }
+      }
+    });
+
+    connection.socket.on('close', () => {
+      fastify.log.info('Client disconnected');
+      clearInterval(pingInterval);
+      clearInterval(healthCheckInterval);
+      clearTimeout(reconnectTimer);
+      messageQueue.clear();
+      
+      if (wsClient) {
+        try {
+          wsClient.close();
+        } catch (err) {
+          fastify.log.error({ err }, 'Error closing WebSocket');
+        }
+      }
+    });
+  });
+
+  try {
+    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    fastify.log.info(`Listening on port ${PORT}, proxying to ${PROXY_TO}`);
+  } catch (err) {
+    fastify.log.error({ err }, 'Error starting server');
+    process.exit(1);
+  }
 }
 
 // Запускаем сервер
