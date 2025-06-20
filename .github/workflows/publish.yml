@@ -27,7 +27,7 @@ jobs:
       - uses: docker/metadata-action@v3
         id: meta
         with:
-          images: ghcr.io/ambrosus/airdao-rpc-proxy
+          images: ghcr.io/ascendia-network/airdao-rpc-proxy
 
       - name: Build and push
         uses: docker/build-push-action@v2
