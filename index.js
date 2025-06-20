@@ -232,6 +232,12 @@ wss.on('connection', (ws, req) => {
   activeConnections++;
   log('info', 'Client connected', { connectionId: connId, activeConnections, clientIP: req.connection.remoteAddress });
 
+  // Принудительный таймаут для предотвращения зависания соединений
+  const forceCloseTimeout = setTimeout(() => {
+    log('warn', 'Force closing stale connection', { connectionId: connId });
+    ws.terminate();
+  }, CONNECTION_TIMEOUT + 30000); // +30 секунд к основному таймауту
+
   let inactivityTimer = null;
   let targetConnection = null;
 
@@ -291,6 +297,7 @@ wss.on('connection', (ws, req) => {
 
   // Обработка закрытия соединения клиента
   ws.on('close', (code, reason) => {
+    clearTimeout(forceCloseTimeout);
     log('info', 'Client disconnected', { 
       connectionId: connId, 
       code, 
@@ -306,7 +313,9 @@ wss.on('connection', (ws, req) => {
 
   // Обработка ошибок клиента
   ws.on('error', (err) => {
+    clearTimeout(forceCloseTimeout);
     log('error', 'Client WebSocket error', { connectionId: connId, error: err.message });
+    activeConnections--;
     targetConnection.close();
     if (inactivityTimer && inactivityTimer.cleanup) {
       inactivityTimer.cleanup();
@@ -343,6 +352,16 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   log('error', 'Unhandled rejection', { reason, promise });
 });
+
+// Мониторинг подключений каждые 30 секунд
+setInterval(() => {
+  log('info', 'Connection stats', { 
+    activeConnections, 
+    maxConnections: MAX_CONNECTIONS,
+    uptime: process.uptime(),
+    memoryUsage: process.memoryUsage()
+  });
+}, 30000);
 
 // Запуск сервера
 server.listen(PORT, () => {
