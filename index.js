@@ -79,11 +79,11 @@ let activeConnections = 0;
 let connectionId = 0;
 
 // Улучшенный таймер неактивности
-function startInactivityTimer(ws, targetWs, connId) {
+function startInactivityTimer(ws, targetConnection, connId) {
   let timeout = setTimeout(() => {
     log('info', 'Connection inactive, closing', { connectionId: connId });
     safeClose(ws, 1000, 'Timeout');
-    safeClose(targetWs, 1000, 'Timeout');
+    targetConnection.close();
   }, CONNECTION_TIMEOUT);
 
   const reset = () => {
@@ -91,21 +91,20 @@ function startInactivityTimer(ws, targetWs, connId) {
     timeout = setTimeout(() => {
       log('info', 'Connection inactive, closing', { connectionId: connId });
       safeClose(ws, 1000, 'Timeout');
-      safeClose(targetWs, 1000, 'Timeout');
+      targetConnection.close();
     }, CONNECTION_TIMEOUT);
   };
 
+  // Сброс таймера при активности клиента
   ws.on('message', reset);
-  targetWs.on('message', reset);
   
   const cleanup = () => {
     clearTimeout(timeout);
   };
   
   ws.on('close', cleanup);
-  targetWs.on('close', cleanup);
   
-  return cleanup;
+  return { cleanup, reset };
 }
 
 // Безопасное закрытие WebSocket
@@ -120,7 +119,7 @@ function safeClose(ws, code = 1000, reason = '') {
 }
 
 // Создание upstream WebSocket с переподключением
-function createUpstreamConnection(connId, onMessage, onClose, onError) {
+function createUpstreamConnection(connId, onMessage, onClose, onError, onActivity) {
   let attempts = 0;
   let ws = null;
   let messageQueue = [];
@@ -160,6 +159,8 @@ function createUpstreamConnection(connId, onMessage, onClose, onError) {
       if (!DISABLE_REQUEST_LOGGING) {
         log('debug', 'Upstream message received', { connectionId: connId });
       }
+      // Уведомление о активности для сброса таймера
+      if (onActivity) onActivity();
       onMessage(data);
     });
 
@@ -231,7 +232,7 @@ wss.on('connection', (ws, req) => {
   activeConnections++;
   log('info', 'Client connected', { connectionId: connId, activeConnections, clientIP: req.connection.remoteAddress });
 
-  let cleanupTimer = null;
+  let inactivityTimer = null;
   let targetConnection = null;
 
   // Создание upstream соединения
@@ -252,6 +253,12 @@ wss.on('connection', (ws, req) => {
     (err) => {
       log('error', 'Upstream connection failed', { connectionId: connId, error: err.message });
       safeClose(ws, 1002, 'Upstream error');
+    },
+    // onActivity - сброс таймера неактивности при получении сообщений от upstream
+    () => {
+      if (inactivityTimer && inactivityTimer.reset) {
+        inactivityTimer.reset();
+      }
     }
   );
 
@@ -292,18 +299,22 @@ wss.on('connection', (ws, req) => {
     });
     activeConnections--;
     targetConnection.close();
-    if (cleanupTimer) cleanupTimer();
+    if (inactivityTimer && inactivityTimer.cleanup) {
+      inactivityTimer.cleanup();
+    }
   });
 
   // Обработка ошибок клиента
   ws.on('error', (err) => {
     log('error', 'Client WebSocket error', { connectionId: connId, error: err.message });
     targetConnection.close();
-    if (cleanupTimer) cleanupTimer();
+    if (inactivityTimer && inactivityTimer.cleanup) {
+      inactivityTimer.cleanup();
+    }
   });
 
   // Запуск таймера неактивности
-  cleanupTimer = startInactivityTimer(ws, { close: () => targetConnection.close() }, connId);
+  inactivityTimer = startInactivityTimer(ws, targetConnection, connId);
 });
 
 // Graceful shutdown
