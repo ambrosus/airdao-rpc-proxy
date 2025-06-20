@@ -9,11 +9,37 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const PORT = process.env.PORT || 6095;
 const RPC_TARGET = process.env.PROXY_TO || 'https://network.ambrosus.io';
 const WS_TARGET = RPC_TARGET.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
-const MAX_CONNECTIONS = parseInt(process.env.MAX_PARALLEL_CONNECTIONS) || 20;
+const MAX_CONNECTIONS = parseInt(process.env.MAX_PARALLEL_CONNECTIONS) || 30;
 const CONNECTION_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 60 * 1000;
-const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS) || 10;
-const UPSTREAM_CONNECT_TIMEOUT = 30 * 1000; // 30 секунд на подключение к upstream
-const MESSAGE_QUEUE_SIZE = 100; // Максимум сообщений в очереди на upstream
+const WS_RECONNECT_MAX_ATTEMPTS = parseInt(process.env.WS_RECONNECT_MAX_ATTEMPTS) || 3; // Уменьшили!
+const UPSTREAM_CONNECT_TIMEOUT = 10 * 1000; // Уменьшили до 10 секунд
+const MESSAGE_QUEUE_SIZE = 10; // Уменьшили очередь!
+
+// Rate limiting
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 минута
+const RATE_LIMIT_MAX_REQUESTS = 100; // 100 запросов в минуту на соединение
+const CLIENT_RATE_LIMITS = new Map(); // IP -> { count, resetTime }
+
+// Rate limiting функция
+function checkRateLimit(clientIP) {
+  const now = Date.now();
+  const clientLimit = CLIENT_RATE_LIMITS.get(clientIP);
+  
+  if (!clientLimit || now > clientLimit.resetTime) {
+    CLIENT_RATE_LIMITS.set(clientIP, {
+      count: 1,
+      resetTime: now + RATE_LIMIT_WINDOW
+    });
+    return true;
+  }
+  
+  if (clientLimit.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  
+  clientLimit.count++;
+  return true;
+}
 
 // Логирование
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
@@ -176,8 +202,12 @@ function createUpstreamConnection(connId, onMessage, onClose, onError, onActivit
       
       // Переподключение только если не достигли лимита попыток
       if (attempts < WS_RECONNECT_MAX_ATTEMPTS) {
-        setTimeout(() => connect(), Math.min(1000 * attempts, 10000));
+        // Экспоненциальная задержка с рандомизацией против thundering herd
+        const delay = Math.min(1000 * Math.pow(2, attempts) + Math.random() * 1000, 30000);
+        log('info', 'Scheduling reconnection', { connectionId: connId, delay });
+        setTimeout(() => connect(), delay);
       } else {
+        log('error', 'Max reconnection attempts reached, giving up', { connectionId: connId });
         onClose();
       }
     });
@@ -270,6 +300,14 @@ wss.on('connection', (ws, req) => {
 
   // Обработка сообщений от клиента
   ws.on('message', (message) => {
+    // Rate limiting проверка
+    const clientIP = req.connection.remoteAddress;
+    if (!checkRateLimit(clientIP)) {
+      log('warn', 'Rate limit exceeded', { connectionId: connId, clientIP });
+      ws.close(1008, 'Rate limit exceeded');
+      return;
+    }
+
     try {
       if (!DISABLE_REQUEST_LOGGING) {
         log('debug', 'Client message received', { connectionId: connId });
