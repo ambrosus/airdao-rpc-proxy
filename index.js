@@ -6,12 +6,23 @@ const cors = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const PORT = process.env.PORT || 6095;
-const RPC_TARGET = 'https://network.ambrosus.io';
-const WS_TARGET = 'wss://network.ambrosus.io/ws';
-const MAX_CONNECTIONS = 100;
-const CONNECTION_TIMEOUT = 60 * 1000;
+const RPC_TARGET = process.env.PROXY_TO || 'https://network.ambrosus.io';
+const WS_TARGET = RPC_TARGET.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws';
+const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS) || 100;
+const CONNECTION_TIMEOUT = parseInt(process.env.CONNECTION_TIMEOUT) || 60 * 1000;
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 70000;
+const LOG_LEVEL = process.env.LOG_LEVEL || 'error';
+const DISABLE_REQUEST_LOGGING = process.env.DISABLE_REQUEST_LOGGING === 'true';
+
+const logger = {
+  error: (msg, ...args) => console.error(`[ERROR] ${msg}`, ...args),
+  warn: (msg, ...args) => LOG_LEVEL !== 'error' && console.warn(`[WARN] ${msg}`, ...args),
+  info: (msg, ...args) => ['info', 'debug'].includes(LOG_LEVEL) && console.info(`[INFO] ${msg}`, ...args),
+  debug: (msg, ...args) => LOG_LEVEL === 'debug' && console.log(`[DEBUG] ${msg}`, ...args)
+};
 
 const app = express();
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
@@ -27,63 +38,144 @@ app.use('/rpc', (req, res, next) => {
   next();
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'ok', 
+    activeConnections,
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
 const rpcProxy = createProxyMiddleware({
   target: RPC_TARGET,
   changeOrigin: true,
   pathRewrite: { '^/rpc': '' },
+  timeout: REQUEST_TIMEOUT,
+  proxyTimeout: REQUEST_TIMEOUT,
   onProxyReq: (proxyReq, req, res) => {
     if (req.body) {
       const bodyData = JSON.stringify(req.body);
+      proxyReq.setHeader('Content-Type', 'application/json');
       proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
       proxyReq.write(bodyData);
     }
-  }
+  },
+  onError: (err, req, res) => {
+    logger.error('RPC Proxy error:', err.message);
+    res.status(502).json({ 
+      error: 'Proxy error', 
+      message: 'Unable to connect to target server' 
+    });
+  },
+  onProxyReq: !DISABLE_REQUEST_LOGGING ? (proxyReq, req, res) => {
+    logger.debug(`RPC Request: ${req.method} ${req.path}`);
+  } : undefined
 });
 
 app.use('/rpc', rpcProxy);
 
 const server = http.createServer(app);
 
-const wss = new WebSocket.Server({ server, path: '/ws' });
-let activeConnections = 0;
+const wss = new WebSocket.Server({ 
+  server, 
+  path: '/ws',
+  perMessageDeflate: false
+});
 
-function startInactivityTimer(ws, targetWs) {
+let activeConnections = 0;
+const connectionStats = {
+  total: 0,
+  rejected: 0,
+  errors: 0
+};
+
+function createInactivityTimer(ws, targetWs, connectionId) {
   let timeout = setTimeout(() => {
-    console.log('Connection inactive, closing...');
+    logger.info(`Connection ${connectionId} inactive, closing...`);
     ws.close();
-    targetWs.close();
+    if (targetWs.readyState !== WebSocket.CLOSED) {
+      targetWs.close();
+    }
   }, CONNECTION_TIMEOUT);
 
-  const reset = () => {
+  const resetTimer = () => {
     clearTimeout(timeout);
     timeout = setTimeout(() => {
-      console.log('Connection inactive, closing...');
+      logger.info(`Connection ${connectionId} inactive, closing...`);
       ws.close();
-      targetWs.close();
+      if (targetWs.readyState !== WebSocket.CLOSED) {
+        targetWs.close();
+      }
     }, CONNECTION_TIMEOUT);
   };
 
-  ws.on('message', reset);
-  targetWs.on('message', reset);
-  ws.on('close', () => clearTimeout(timeout));
-  targetWs.on('close', () => clearTimeout(timeout));
+  const clearTimer = () => {
+    clearTimeout(timeout);
+  };
+
+  return { resetTimer, clearTimer };
 }
 
-wss.on('connection', (ws) => {
+function safeSend(ws, data) {
+  if (ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(data);
+      return true;
+    } catch (error) {
+      logger.error('Error sending message:', error.message);
+      return false;
+    }
+  }
+  return false;
+}
+
+wss.on('connection', (ws, req) => {
   if (activeConnections >= MAX_CONNECTIONS) {
-    console.log('Too many connections, rejecting');
+    logger.warn('Too many connections, rejecting');
+    connectionStats.rejected++;
     ws.close(1013, 'Too many connections');
     return;
   }
 
   activeConnections++;
-  console.log(`Client connected (${activeConnections} total)`);
+  connectionStats.total++;
+  const connectionId = connectionStats.total;
+  
+  logger.info(`Client connected (${activeConnections}/${MAX_CONNECTIONS} active) ID: ${connectionId}`);
 
-  let targetWs = new WebSocket(WS_TARGET);
+  let targetWs;
+  try {
+    targetWs = new WebSocket(WS_TARGET, {
+      handshakeTimeout: 10000,
+      perMessageDeflate: false
+    });
+  } catch (error) {
+    logger.error('Failed to create target WebSocket:', error.message);
+    ws.close(1011, 'Internal error');
+    activeConnections--;
+    return;
+  }
+
+  const { resetTimer, clearTimer } = createInactivityTimer(ws, targetWs, connectionId);
+  let isConnected = false;
+
+  targetWs.on('open', () => {
+    isConnected = true;
+    logger.debug(`Target connection established for client ${connectionId}`);
+  });
 
   ws.on('message', (message) => {
+    resetTimer();
+    
+    if (!isConnected) {
+      logger.warn(`Message received before target connection established for client ${connectionId}`);
+      return;
+    }
+
     try {
       const parsed = JSON.parse(message.toString());
+      
       if (parsed.params) {
         parsed.params = parsed.params.map(param => {
           if (param && param.input) {
@@ -92,47 +184,97 @@ wss.on('connection', (ws) => {
           return param;
         });
       }
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify(parsed));
-      }
+      
+      safeSend(targetWs, JSON.stringify(parsed));
     } catch (err) {
-      console.error('Message parsing error:', err);
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(message);
-      }
+      logger.error(`Message parsing error for client ${connectionId}:`, err.message);
+      safeSend(targetWs, message);
     }
   });
 
   targetWs.on('message', (msg) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
+    resetTimer();
+    safeSend(ws, msg);
+  });
+
+  ws.on('close', (code, reason) => {
+    logger.info(`Client ${connectionId} disconnected (${code}: ${reason})`);
+    activeConnections--;
+    clearTimer();
+    if (targetWs.readyState !== WebSocket.CLOSED) {
+      targetWs.close();
     }
   });
 
-  ws.on('close', () => {
-    console.log('Client disconnected');
-    activeConnections--;
-    targetWs.close();
-  });
-
-  targetWs.on('close', () => {
-    if (ws.readyState === WebSocket.OPEN) ws.close();
+  targetWs.on('close', (code, reason) => {
+    logger.info(`Target connection closed for client ${connectionId} (${code}: ${reason})`);
+    clearTimer();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close(1011, 'Target server disconnected');
+    }
   });
 
   ws.on('error', (err) => {
-    console.error('Client WS error:', err);
-    targetWs.close();
+    logger.error(`Client WS error for ${connectionId}:`, err.message);
+    connectionStats.errors++;
+    clearTimer();
+    if (targetWs.readyState !== WebSocket.CLOSED) {
+      targetWs.close();
+    }
   });
 
   targetWs.on('error', (err) => {
-    console.error('Target WS error:', err);
-    ws.close();
+    logger.error(`Target WS error for ${connectionId}:`, err.message);
+    connectionStats.errors++;
+    clearTimer();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close(1011, 'Target server error');
+    }
   });
-
-  startInactivityTimer(ws, targetWs);
 });
 
-// Start server
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, starting graceful shutdown...');
+  
+  wss.clients.forEach((ws) => {
+    ws.close(1001, 'Server shutting down');
+  });
+  
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, starting graceful shutdown...');
+  
+  wss.clients.forEach((ws) => {
+    ws.close(1001, 'Server shutting down');
+  });
+  
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+if (LOG_LEVEL === 'debug') {
+  setInterval(() => {
+    logger.debug('Connection stats:', {
+      active: activeConnections,
+      total: connectionStats.total,
+      rejected: connectionStats.rejected,
+      errors: connectionStats.errors,
+      memory: process.memoryUsage()
+    });
+  }, 60000);
+}
+
 server.listen(PORT, () => {
-  console.log(`Proxy server running on port ${PORT}`);
+  logger.info(`Proxy server running on port ${PORT}`);
+  logger.info(`RPC Target: ${RPC_TARGET}`);
+  logger.info(`WS Target: ${WS_TARGET}`);
+  logger.info(`Max connections: ${MAX_CONNECTIONS}`);
+  logger.info(`Connection timeout: ${CONNECTION_TIMEOUT}ms`);
 });
