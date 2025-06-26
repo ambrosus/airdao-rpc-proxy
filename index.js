@@ -11,7 +11,7 @@ const WS_TARGET = RPC_TARGET.replace('https://', 'wss://').replace('http://', 'w
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS) || 100;
 const CONNECTION_TIMEOUT = parseInt(process.env.CONNECTION_TIMEOUT) || 60 * 1000;
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 70000;
-const LOG_LEVEL = process.env.LOG_LEVEL || 'error';
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const DISABLE_REQUEST_LOGGING = process.env.DISABLE_REQUEST_LOGGING === 'true';
 
 const logger = {
@@ -175,27 +175,16 @@ wss.on('connection', (ws, req) => {
 
     try {
       const parsed = JSON.parse(message.toString());
+      logger.debug(`Client ${connectionId} sent: ${parsed.method || 'unknown method'}`);
       
-      if (parsed.params) {
+      if (parsed.params && Array.isArray(parsed.params)) {
         parsed.params = parsed.params.map(param => {
-          if (param && param.input) {
+          if (param && typeof param === 'object' && param.input) {
             return { ...param, data: param.input, input: undefined };
           }
           return param;
         });
       }
-      
-      safeSend(targetWs, JSON.stringify(parsed));
-    } catch (err) {
-      logger.error(`Message parsing error for client ${connectionId}:`, err.message);
-      safeSend(targetWs, message);
-    }
-  });
-
-  targetWs.on('message', (msg) => {
-    resetTimer();
-    safeSend(ws, msg);
-  });
 
   ws.on('close', (code, reason) => {
     logger.info(`Client ${connectionId} disconnected (${code}: ${reason})`);
