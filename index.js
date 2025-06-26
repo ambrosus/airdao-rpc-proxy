@@ -46,8 +46,6 @@ app.use('/rpc', (req, res, next) => {
   next();
 });
 
-
-
 // Расширенный health check
 app.get('/health', (req, res) => {
   const uptime = process.uptime();
@@ -79,8 +77,6 @@ app.get('/health', (req, res) => {
 
   res.status(200).json(healthData);
 });
-
-
 
 const rpcProxy = createProxyMiddleware({
   target: RPC_TARGET,
@@ -364,7 +360,6 @@ wss.on('connection', (ws, req) => {
   ws.on('close', (code, reason) => {
     logger.info(`Client ${connectionId} disconnected (${code}: ${reason})`);
     activeConnections--;
-    metrics.connections.active = activeConnections;
     
     if (inactivityTimer) inactivityTimer.clearTimer();
     heartbeat.clearHeartbeat();
@@ -391,7 +386,6 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => {
     logger.error(`Client WS error for ${connectionId}:`, err.message);
     connectionStats.errors++;
-    updateMetrics('connection', { event: 'error' });
     
     if (inactivityTimer) inactivityTimer.clearTimer();
     heartbeat.clearHeartbeat();
@@ -404,7 +398,6 @@ wss.on('connection', (ws, req) => {
   targetWs.on('error', (err) => {
     logger.error(`Target WS error for ${connectionId}:`, err.message);
     connectionStats.errors++;
-    updateMetrics('connection', { event: 'error' });
     
     if (inactivityTimer) inactivityTimer.clearTimer();
     heartbeat.clearHeartbeat();
@@ -418,17 +411,6 @@ wss.on('connection', (ws, req) => {
 // Graceful shutdown
 function gracefulShutdown(signal) {
   logger.info(`${signal} received, starting graceful shutdown...`);
-  
-  // Сохраняем финальные метрики
-  if (ENABLE_METRICS) {
-    logger.info('Final metrics:', {
-      uptime: Date.now() - metrics.startTime,
-      totalConnections: metrics.connections.total,
-      totalRequests: metrics.requests.total,
-      errorRate: metrics.requests.total > 0 ? 
-        (metrics.requests.failed / metrics.requests.total * 100).toFixed(2) + '%' : '0%'
-    });
-  }
   
   wss.clients.forEach((ws) => {
     ws.close(1001, 'Server shutting down');
@@ -475,15 +457,6 @@ if (LOG_LEVEL === 'debug') {
         rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`
       }
     });
-    
-    if (ENABLE_METRICS) {
-      logger.debug('Performance stats:', {
-        requestsPerMinute: metrics.requests.total / ((Date.now() - metrics.startTime) / 60000),
-        avgResponseTime: `${Math.round(metrics.performance.avgResponseTime)}ms`,
-        errorRate: metrics.requests.total > 0 ? 
-          (metrics.requests.failed / metrics.requests.total * 100).toFixed(2) + '%' : '0%'
-      });
-    }
   }, 60000);
 }
 
@@ -495,7 +468,6 @@ server.listen(PORT, () => {
   logger.info(`Connection timeout: ${CONNECTION_TIMEOUT}ms`);
   logger.info(`Request timeout: ${REQUEST_TIMEOUT}ms`);
   logger.info(`Heartbeat enabled: ${ENABLE_HEARTBEAT}`);
-  logger.info(`Metrics enabled: ${ENABLE_METRICS}`);
   logger.info(`Log level: ${LOG_LEVEL}`);
   
   if (ENABLE_HEARTBEAT) {
