@@ -27,9 +27,9 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 
 app.use('/rpc', (req, res, next) => {
-  if (req.body && req.body.params) {
+  if (req.body && req.body.params && Array.isArray(req.body.params)) {
     req.body.params = req.body.params.map(param => {
-      if (param && param.input) {
+      if (param && typeof param === 'object' && param.input) {
         return { ...param, data: param.input, input: undefined };
       }
       return param;
@@ -175,7 +175,6 @@ wss.on('connection', (ws, req) => {
 
     try {
       const parsed = JSON.parse(message.toString());
-      logger.debug(`Client ${connectionId} sent: ${parsed.method || 'unknown method'}`);
       
       if (parsed.params && Array.isArray(parsed.params)) {
         parsed.params = parsed.params.map(param => {
@@ -185,6 +184,19 @@ wss.on('connection', (ws, req) => {
           return param;
         });
       }
+      
+      safeSend(targetWs, JSON.stringify(parsed));
+      
+    } catch (err) {
+      logger.error(`Message parsing error for client ${connectionId}:`, err.message);
+      safeSend(targetWs, message);
+    }
+  });
+
+  targetWs.on('message', (msg) => {
+    resetTimer();
+    safeSend(ws, msg);
+  });
 
   ws.on('close', (code, reason) => {
     logger.info(`Client ${connectionId} disconnected (${code}: ${reason})`);
