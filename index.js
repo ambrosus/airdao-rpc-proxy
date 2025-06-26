@@ -159,10 +159,18 @@ wss.on('connection', (ws, req) => {
 
   const { resetTimer, clearTimer } = createInactivityTimer(ws, targetWs, connectionId);
   let isConnected = false;
+  let targetReady = false;
+  let pendingMessages = [];
 
   targetWs.on('open', () => {
+    targetReady = true;
     isConnected = true;
     logger.debug(`Target connection established for client ${connectionId}`);
+    
+    pendingMessages.forEach(msg => {
+      targetWs.send(msg);
+    });
+    pendingMessages = [];
   });
 
   ws.on('message', (message) => {
