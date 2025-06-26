@@ -130,6 +130,15 @@ function safeSend(ws, data) {
   return false;
 }
 
+function isChainIdMethod(message) {
+  try {
+    const parsed = JSON.parse(message.toString());
+    return parsed.method === 'eth_chainId';
+  } catch (err) {
+    return false;
+  }
+}
+
 wss.on('connection', (ws, req) => {
   if (activeConnections >= MAX_CONNECTIONS) {
     logger.warn('Too many connections, rejecting');
@@ -178,6 +187,12 @@ wss.on('connection', (ws, req) => {
     
     if (!isConnected) {
       logger.warn(`Message received before target connection established for client ${connectionId}`);
+      return;
+    }
+
+    if (isChainIdMethod(message)) {
+      logger.debug(`chainId request from client ${connectionId}, forwarding directly`);
+      safeSend(targetWs, message);
       return;
     }
 
